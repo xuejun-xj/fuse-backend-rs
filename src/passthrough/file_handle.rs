@@ -9,7 +9,6 @@ use std::fmt::{Debug, Formatter};
 use std::fs::File;
 use std::io;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::ptr;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::passthrough::PassthroughFs;
@@ -18,32 +17,28 @@ use crate::passthrough::PassthroughFs;
 ///
 /// According to Linux ABI, struct file_handle has a flexible array member 'f_handle', but it's
 /// hard-coded here for simplicity.
-//pub const MAX_HANDLE_SZ: usize = 128;
+pub const MAX_HANDLE_SZ: usize = 128;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct CFileHandle {
+pub(crate) struct CFileHandle {
     // Size of f_handle [in, out]
-    handle_bytes: libc::c_uint,
+    pub(crate) handle_bytes: libc::c_uint,
     // Handle type [out]
-    handle_type: libc::c_int,
+    pub(crate) handle_type: libc::c_int,
     // File identifier (sized by caller) [out]
-    f_handle: *mut libc::c_char,
+    pub(crate) f_handle: [libc::c_char; MAX_HANDLE_SZ],
 }
 
 impl CFileHandle {
     fn new() -> Self {
         CFileHandle {
-            handle_bytes: 0,
+            handle_bytes: MAX_HANDLE_SZ as libc::c_uint,
             handle_type: 0,
-            f_handle: ptr::null_mut(),
+            f_handle: [0; MAX_HANDLE_SZ],
         }
     }
 }
-
-// Safe because f_handle is readonly once FileHandle is initialized.
-unsafe impl Send for CFileHandle {}
-unsafe impl Sync for CFileHandle {}
 
 impl Ord for CFileHandle {
     fn cmp(&self, other: &Self) -> Ordering {
@@ -54,8 +49,12 @@ impl Ord for CFileHandle {
             return self.handle_type.cmp(&other.handle_type);
         }
 
-        // f_handle is left to be compared by FileHandle's buf.
-        Ordering::Equal
+        self.f_handle
+            .iter()
+            .zip(other.f_handle.iter())
+            .map(|(x, y)| x.cmp(y))
+            .find(|&ord| ord != std::cmp::Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
     }
 }
 
@@ -84,12 +83,10 @@ impl Debug for CFileHandle {
 }
 
 /// Struct to maintain information for a file handle.
-#[derive(Clone, PartialOrd, Ord, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialOrd, Ord, PartialEq, Eq, Debug)]
 pub struct FileHandle {
     pub(crate) mnt_id: u64,
-    handle: CFileHandle,
-    // internal buffer for handle.f_handle
-    buf: Vec<libc::c_char>,
+    pub(crate) handle: CFileHandle,
 }
 
 extern "C" {
@@ -116,38 +113,6 @@ impl FileHandle {
         let mut mount_id: libc::c_int = 0;
         let mut c_fh = CFileHandle::new();
 
-        // Per name_to_handle_at(2), the caller can discover the required size
-        // for the file_handle structure by making a call in which
-        // handle->handle_bytes is zero.  In this case, the call fails with the
-        // error EOVERFLOW and handle->handle_bytes is set to indicate the
-        // required size; the caller can then use this information to allocate a
-        // structure of the correct size.
-        let ret = unsafe {
-            name_to_handle_at(
-                dir_fd,
-                path.as_ptr(),
-                &mut c_fh,
-                &mut mount_id,
-                libc::AT_EMPTY_PATH,
-            )
-        };
-        if ret == -1 {
-            let e = io::Error::last_os_error();
-            // unwrap is safe as e is obtained from last_os_error().
-            if e.raw_os_error().unwrap() != libc::EOVERFLOW {
-                return Err(e);
-            }
-        } else {
-            return Err(io::Error::from(io::ErrorKind::InvalidData));
-        }
-
-        let needed = c_fh.handle_bytes as usize;
-        let mut buf = vec![0; needed];
-
-        // get a unsafe pointer, FileHandle takes care of freeing the memory
-        // that 'f_handle' points to.
-        c_fh.f_handle = buf.as_mut_ptr();
-
         let ret = unsafe {
             name_to_handle_at(
                 dir_fd,
@@ -161,7 +126,6 @@ impl FileHandle {
             Ok(FileHandle {
                 mnt_id: mount_id as u64,
                 handle: c_fh,
-                buf,
             })
         } else {
             let e = io::Error::last_os_error();
@@ -332,80 +296,43 @@ mod tests {
 
     #[test]
     fn test_file_handle_derives() {
-        let mut buf1 = vec![0; 128];
-        let h1 = CFileHandle {
+        let mut h1 = CFileHandle {
             handle_bytes: 128,
             handle_type: 3,
-            f_handle: buf1.as_mut_ptr(),
+            f_handle: [0; MAX_HANDLE_SZ],
         };
-        let mut fh1 = FileHandle {
-            mnt_id: 0,
-            handle: h1,
-            buf: buf1,
-        };
-
-        let mut buf2 = vec![0; 129];
         let h2 = CFileHandle {
             handle_bytes: 129,
             handle_type: 3,
-            f_handle: buf2.as_mut_ptr(),
+            f_handle: [0; MAX_HANDLE_SZ],
         };
-        let fh2 = FileHandle {
-            mnt_id: 0,
-            handle: h2,
-            buf: buf2,
-        };
-
-        let mut buf3 = vec![0; 128];
         let h3 = CFileHandle {
             handle_bytes: 128,
             handle_type: 4,
-            f_handle: buf3.as_mut_ptr(),
+            f_handle: [0; MAX_HANDLE_SZ],
         };
-        let fh3 = FileHandle {
-            mnt_id: 0,
-            handle: h3,
-            buf: buf3,
-        };
-
-        let mut buf4 = vec![1; 128];
         let h4 = CFileHandle {
             handle_bytes: 128,
-            handle_type: 3,
-            f_handle: buf4.as_mut_ptr(),
+            handle_type: 4,
+            f_handle: [1; MAX_HANDLE_SZ],
         };
-        let fh4 = FileHandle {
-            mnt_id: 0,
-            handle: h4,
-            buf: buf4,
-        };
-
-        let mut buf5 = vec![0; 128];
-        let h5 = CFileHandle {
+        let mut h5 = CFileHandle {
             handle_bytes: 128,
             handle_type: 3,
-            f_handle: buf5.as_mut_ptr(),
-        };
-        let mut fh5 = FileHandle {
-            mnt_id: 0,
-            handle: h5,
-            buf: buf5,
+            f_handle: [0; MAX_HANDLE_SZ],
         };
 
-        assert!(fh1 < fh2);
-        assert!(fh1 != fh2);
-        assert!(fh1 < fh3);
-        assert!(fh1 != fh3);
-        assert!(fh1 < fh4);
-        assert!(fh1 != fh4);
+        assert!(h1 < h2);
+        assert!(h1 != h2);
+        assert!(h1 < h3);
+        assert!(h1 != h3);
+        assert!(h1 < h4);
+        assert!(h1 != h4);
 
-        assert!(fh1 == fh5);
-        fh1.buf[0] = 1;
-        fh1.handle.f_handle = fh1.buf.as_mut_ptr();
-        assert!(fh1 > fh5);
-
-        fh5.buf[0] = 1;
-        fh5.handle.f_handle = fh5.buf.as_mut_ptr();
-        assert!(fh1 == fh5);
+        assert!(h1 == h5);
+        h1.f_handle[0] = 1;
+        assert!(h1 > h5);
+        h5.f_handle[0] = 1;
+        assert!(h1 == h5);
     }
 }
