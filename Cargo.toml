@@ -20,6 +20,7 @@ build = "build.rs"
 members = [
     "tests/passthrough",
     "tests/overlay",
+    "tests/benchmark",
 ]
 
 [workspace.dependencies]
