@@ -26,6 +26,31 @@ So the fuse-rs crate is a library to communicate with the Linux FUSE clients, wh
 
 ![arch](docs/images/fuse-backend-architecture.svg)
 
+## Async IO (Experimental)
+
+Besides the traditional synchronous IO path, an asynchronous IO path is provided
+through the optional `async-io` cargo feature, e.g.:
+
+```toml
+[dependencies]
+fuse-backend-rs = { git = "https://github.com/cloud-hypervisor/fuse-backend-rs", features = ["fusedev", "async-io"] }
+```
+
+The `async-io` feature is not part of a released crate version yet, so depend
+on the git repository directly. Please note that the feature is still
+**experimental**:
+- It depends on [tokio-uring](https://github.com/tokio-rs/tokio-uring) and
+  [io_uring](https://kernel.dk/io_uring.pdf), so it's only available on Linux.
+  Builds with the feature enabled will fail on other platforms.
+- The asynchronous interfaces and behavior may change in future releases.
+- The asynchronous handlers of `PassthroughFs` currently relay requests to their
+  synchronous counterparts, so the blocking syscalls run in the context of the
+  async runtime. A native io_uring based implementation is planned for the future.
+
+To serve requests asynchronously, mount the filesystem through `Vfs` and drive a
+`FuseDevTask` (fusedev transport) inside an async runtime, refer to
+[tests/async_smoke.rs](tests/async_smoke.rs) for a working example.
+
 ## Examples
 
 ### Filesystem Drivers

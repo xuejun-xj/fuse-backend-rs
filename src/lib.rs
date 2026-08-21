@@ -46,6 +46,9 @@
 //! * Filesystem Drivers. Filesystem drivers implement the concrete Fuse filesystem logic,
 //!   at what ever is suitable. A default ["passthrough"](passthrough/index.html) filesystem
 //!   driver is implemented as a sample.
+//! * Async IO (Experimental). An optional `async-io` cargo feature adds an asynchronous IO
+//!   path based on tokio-uring/io_uring, which is only available on Linux and may change
+//!   in future releases.
 
 extern crate bitflags;
 extern crate libc;

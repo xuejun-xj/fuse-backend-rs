@@ -1,5 +1,7 @@
 # Changelog
 ## [Unreleased]
+### Added
+- [188](https://github.com/cloud-hypervisor/fuse-backend-rs/issues/188): docs: document the experimental status of async-io support.
 
 ## [0.14.0]
 ### Added
