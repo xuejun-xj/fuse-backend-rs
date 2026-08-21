@@ -732,7 +732,7 @@ mod asyncio {
     /// the fuse device file, a internal buffer and a `Server` instance to serve requests.
     ///
     /// ## Examples
-    /// ```ignore
+    /// ```text
     /// let buf_size = 0x1_0000;
     /// let file = session.clone_fuse_file().unwrap();
     /// let state = Arc::new(AtomicBool::new(false));
