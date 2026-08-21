@@ -505,6 +505,12 @@ mod async_io {
         ///
         /// We need this because the lifetime of others is usually shorter than self.
         pub async fn async_commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
+            if !self.buffered {
+                // In non-buffered mode, all data has been written to the fuse device
+                // synchronously by the write methods, so there's nothing to commit.
+                return Ok(0);
+            }
+
             let o = match other {
                 Some(Writer::FuseDev(w)) => w.buf.as_slice(),
                 _ => &[],
