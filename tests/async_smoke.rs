@@ -101,10 +101,14 @@ mod fusedev_async_tests {
         );
 
         // Perform real IO through the mountpoint from a helper thread while
-        // the async runtime drives `poll_handler()` on this thread.
+        // the async runtime drives `poll_handler()` on this thread. The
+        // helper thread notifies `io_notify` once it's done, to wake up the
+        // async driver.
+        let io_notify = Arc::new(tokio::sync::Notify::new());
         let io_thread = {
             let mnt_path = mnt.as_path().to_path_buf();
             let src_path = src.as_path().to_path_buf();
+            let io_notify = io_notify.clone();
             std::thread::spawn(move || {
                 // Give the task a moment to start polling the fuse device.
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -148,47 +152,42 @@ mod fusedev_async_tests {
                 std::fs::remove_dir(mnt_path.join("subdir")).unwrap();
                 assert!(!src_path.join("file.txt").exists());
                 assert!(!src_path.join("subdir").exists());
+
+                // Tell the driver that the IO has completed.
+                io_notify.notify_one();
             })
         };
 
-        // Drive `poll_handler()` and wait for the IO thread to complete.
-        // Both futures are polled on the same runtime thread: while the
-        // poll handler is waiting for requests on the fuse device, the
-        // wait loop makes progress, and vice versa.
-        //
-        // A helper thread signals timeout if the IO thread doesn't
+        // A watchdog thread signals timeout if the IO thread doesn't
         // complete in time, given that `tokio/time` is not enabled by
         // the `async-io` feature.
-        let done = Arc::new(AtomicBool::new(false));
         let timeout = Arc::new(AtomicBool::new(false));
         {
-            let done = done.clone();
             let timeout = timeout.clone();
+            let io_notify = io_notify.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(60));
-                if !done.load(Ordering::Acquire) {
-                    timeout.store(true, Ordering::Release);
-                }
+                timeout.store(true, Ordering::Release);
+                io_notify.notify_one();
             });
         }
         let rt = Runtime::new();
         let se = guard.0.as_mut().unwrap();
         let timed_out = rt.block_on(async move {
-            let mut poller = Box::pin(task.poll_handler());
-            let mut timed_out = false;
-            loop {
-                if io_thread.is_finished() {
-                    break;
+            // Run `poll_handler()` as a separate task instead of driving it
+            // inline from a busy loop: with the tokio-uring runtime, io_uring
+            // submission queue entries are handed to the kernel when the
+            // runtime parks, and a busy-waiting driver starves the scheduler
+            // and prevents requests from being submitted to the kernel.
+            let mut poller = Runtime::spawn(async move { task.poll_handler().await });
+
+            // Wait for the IO thread to complete, or the watchdog to fire.
+            tokio::select! {
+                res = &mut poller => {
+                    res.expect("the async fuse task panicked");
+                    panic!("the async fuse task terminated unexpectedly");
                 }
-                if timeout.load(Ordering::Acquire) {
-                    timed_out = true;
-                    break;
-                }
-                // Drive the poll handler while the IO thread is running.
-                tokio::select! {
-                    _ = &mut poller => panic!("the async fuse task terminated unexpectedly"),
-                    _ = tokio::task::yield_now() => {}
-                }
+                _ = io_notify.notified() => {}
             }
 
             // Tear the session down from within the runtime: `umount()`
@@ -197,14 +196,14 @@ mod fusedev_async_tests {
             // task and its buffers are dropped, and unblocks any IO
             // still stuck in the kernel with `ECONNREFUSED`.
             se.umount().unwrap();
-            (&mut poller).await;
+            (&mut poller).await.expect("the async fuse task panicked");
 
+            let timed_out = timeout.load(Ordering::Acquire);
             if timed_out {
                 // The helper thread got aborted with ECONNREFUSED.
                 let _ = io_thread.join();
             } else {
                 io_thread.join().expect("the IO helper thread panicked");
-                done.store(true, Ordering::Release);
             }
             timed_out
         });

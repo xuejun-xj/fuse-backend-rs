@@ -788,6 +788,12 @@ mod asyncio {
         /// The async fn repeatedly return Poll::Pending when polled until the state has been set
         /// to quiesce mode, or the fuse session has been torn down (EOF/`ENODEV` from the
         /// fuse device).
+        ///
+        /// Note: when driven by the tokio-uring runtime, io_uring submission queue entries
+        /// are submitted to the kernel whenever the runtime parks, so the driving future
+        /// must not busy-loop and should let the runtime park regularly (e.g. by running
+        /// `poll_handler()` as a separate task). Otherwise requests may pile up in the
+        /// kernel without being served.
         pub async fn poll_handler(&mut self) {
             // TODO: register self.buf as io uring buffers.
             let fd = self.file.as_raw_fd();

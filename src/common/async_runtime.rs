@@ -109,8 +109,9 @@ impl RuntimeType {
 
 /// An adapter enum to support both tokio current-thread Runtime and tokio-uring Runtime.
 pub enum Runtime {
-    /// Tokio current thread Runtime.
-    Tokio(tokio::runtime::Runtime),
+    /// Tokio current thread Runtime, with a `LocalSet` to support spawning
+    /// `!Send` tasks via `spawn_local()`.
+    Tokio(tokio::task::LocalSet, tokio::runtime::Runtime),
     #[cfg(target_os = "linux")]
     /// Tokio-uring Runtime.
     Uring(std::sync::Mutex<tokio_uring::Runtime>),
@@ -139,13 +140,13 @@ impl Runtime {
             .enable_all()
             .build()
             .expect("utils: failed to create tokio runtime for current thread");
-        Runtime::Tokio(rt)
+        Runtime::Tokio(tokio::task::LocalSet::new(), rt)
     }
 
     /// Run a future to completion.
     pub fn block_on<F: Future>(&self, f: F) -> F::Output {
         match self {
-            Runtime::Tokio(rt) => rt.block_on(f),
+            Runtime::Tokio(local, rt) => rt.block_on(local.run_until(f)),
             #[cfg(target_os = "linux")]
             Runtime::Uring(rt) => rt.lock().unwrap().block_on(f),
         }
@@ -158,17 +159,15 @@ impl Runtime {
     /// runtime is shutdown, all outstanding tasks are dropped, regardless of the
     /// lifecycle of that task.
     ///
-    /// This function must be called from the context of a `tokio-uring` runtime.
+    /// This function must be called from the context of a `Runtime` object,
+    /// i.e. within the future passed to `Runtime::block_on()`.
     ///
     /// [`JoinHandle`]: tokio::task::JoinHandle
-    pub fn spawn<T: std::future::Future + 'static>(
-        &self,
-        task: T,
-    ) -> tokio::task::JoinHandle<T::Output> {
-        match self {
-            Runtime::Tokio(_) => tokio::task::spawn_local(task),
+    pub fn spawn<T: std::future::Future + 'static>(task: T) -> tokio::task::JoinHandle<T::Output> {
+        match *RUNTIME_TYPE {
+            RuntimeType::Tokio => tokio::task::spawn_local(task),
             #[cfg(target_os = "linux")]
-            Runtime::Uring(_) => tokio_uring::spawn(task),
+            RuntimeType::Uring => tokio_uring::spawn(task),
         }
     }
 }
@@ -205,12 +204,12 @@ pub fn block_on<F: Future>(f: F) -> F::Output {
 /// runtime is shutdown, all outstanding tasks are dropped, regardless of the
 /// lifecycle of that task.
 ///
-/// This will create a new Runtime to run spawn.
+/// This function must be called from the context of a `Runtime` object,
+/// i.e. within the future passed to `Runtime::block_on()`.
 ///
 /// [`JoinHandle`]: tokio::task::JoinHandle
 pub fn spawn<T: std::future::Future + 'static>(task: T) -> tokio::task::JoinHandle<T::Output> {
-    let rt = Runtime::new();
-    rt.spawn(task)
+    Runtime::spawn(task)
 }
 
 #[cfg(test)]
