@@ -8,10 +8,12 @@
 #
 # For each mode (sync: N worker threads, async: one FuseDevTask on the
 # async runtime), the script mounts the benchmark daemon and runs the same
-# fio workloads against the mountpoint. Raw fio output is stored under
-# $RESULTS_DIR for further analysis.
+# fio workloads against the mountpoint. The fio results are stored in JSON
+# format ($RESULTS_DIR/<mode>-<workload>.json) under $RESULTS_DIR for
+# further analysis, see tests/scripts/bench_compare.py.
 #
-# Requirements: Linux, fio, permission to mount fuse (root or fusermount).
+# Requirements: Linux, fio, jq, permission to mount fuse (root or
+# fusermount).
 #
 # Tunables (environment variables):
 #   THREADS  number of sync worker threads / fio jobs (default 4)
@@ -43,6 +45,7 @@ MNT_DIR="${RESULTS_DIR}/mount"
 mkdir -p "${SRC_DIR}" "${MNT_DIR}"
 
 command -v fio >/dev/null 2>&1 || { echo "error: fio is required" >&2; exit 1; }
+command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
 
 echo "results directory: ${RESULTS_DIR}"
 
@@ -90,11 +93,18 @@ run_workload() {
     echo "--- [${mode}] ${name}: $*"
     fio --name="${name}" --directory="${MNT_DIR}" --group_reporting \
         --time_based --runtime="${RUNTIME}" "$@" \
-        >"${RESULTS_DIR}/${mode}-${name}.out" 2>&1 || {
-            echo "error: fio workload ${name} failed, see ${RESULTS_DIR}/${mode}-${name}.out" >&2
+        --output-format=json \
+        --output="${RESULTS_DIR}/${mode}-${name}.json" || {
+            echo "error: fio workload ${name} failed" >&2
             exit 1
         }
-    grep -E "^  (read|write):" "${RESULTS_DIR}/${mode}-${name}.out" || true
+    # Select the active side like bench_compare.py does: the data
+    # workloads are active on exactly one side, and the filecreate and
+    # filedelete engines may transfer no data at all, so compare iops.
+    jq -r '.jobs[0] | if .read.iops >= .write.iops
+           then "  read: bw=\(.read.bw)KiB/s iops=\(.read.iops | round)"
+           else "  write: bw=\(.write.bw)KiB/s iops=\(.write.iops | round)"
+           end' "${RESULTS_DIR}/${mode}-${name}.json" || true
 }
 
 # run_fixed_workload <mode> <name> <fio args...>
@@ -108,11 +118,15 @@ run_fixed_workload() {
     shift 2
     echo "--- [${mode}] ${name}: $*"
     fio --name="${name}" --directory="${MNT_DIR}" --group_reporting "$@" \
-        >"${RESULTS_DIR}/${mode}-${name}.out" 2>&1 || {
-            echo "error: fio workload ${name} failed, see ${RESULTS_DIR}/${mode}-${name}.out" >&2
+        --output-format=json \
+        --output="${RESULTS_DIR}/${mode}-${name}.json" || {
+            echo "error: fio workload ${name} failed" >&2
             exit 1
         }
-    grep -E "^  (read|write):" "${RESULTS_DIR}/${mode}-${name}.out" || true
+    jq -r '.jobs[0] | if .read.iops >= .write.iops
+           then "  read: iops=\(.read.iops | round) runtime=\(.read.runtime)ms"
+           else "  write: iops=\(.write.iops | round) runtime=\(.write.runtime)ms"
+           end' "${RESULTS_DIR}/${mode}-${name}.json" || true
 }
 
 # shellcheck disable=SC2086
@@ -148,15 +162,22 @@ for mode in ${MODES}; do
 done
 
 # Print a side-by-side summary of the collected results.
+summarize() {
+    jq -r '.jobs[0] | if .read.iops >= .write.iops
+           then "read: bw=\(.read.bw)KiB/s iops=\(.read.iops | round)"
+           else "write: bw=\(.write.bw)KiB/s iops=\(.write.iops | round)"
+           end' "$1" 2>/dev/null || echo "n/a"
+}
+
 echo ""
 echo "############ summary ############"
-printf "%-32s %-24s %-24s\n" "workload" "sync" "async"
-for f in "${RESULTS_DIR}"/sync-*.out; do
-    name=$(basename "${f}" .out)
+printf "%-32s %-36s %-36s\n" "workload" "sync" "async"
+for f in "${RESULTS_DIR}"/sync-*.json; do
+    name=$(basename "${f}" .json)
     name=${name#sync-}
-    sync_line=$(grep -E "^  (read|write):" "${f}" | head -1 | sed 's/^ *//')
-    async_line=$(grep -E "^  (read|write):" "${RESULTS_DIR}/async-${name}.out" 2>/dev/null | head -1 | sed 's/^ *//')
-    printf "%-32s %-24s %-24s\n" "${name}" "${sync_line:-n/a}" "${async_line:-n/a}"
+    printf "%-32s %-36s %-36s\n" "${name}" \
+        "$(summarize "${f}")" \
+        "$(summarize "${RESULTS_DIR}/async-${name}.json")"
 done
 echo ""
 echo "full fio output: ${RESULTS_DIR}"
