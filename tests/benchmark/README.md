@@ -44,10 +44,42 @@ build once as a regular user first (`cd tests/benchmark && cargo build
 --release`) to avoid root-owned artifacts in the workspace `target/`
 directory.
 
-Raw fio output is written to a temporary results directory (printed at the
-start), and a side-by-side summary is printed at the end. The default
-execution order is sync then async; the second mode benefits from a warmer
-page cache, so cross-check with `MODES="async sync"`.
+The fio results are written in JSON format to a temporary results directory
+(printed at the start, `<dir>/<mode>-<workload>.json`), and a side-by-side
+summary is printed at the end. The default execution order is sync then
+async; the second mode benefits from a warmer page cache, so cross-check
+with `MODES="async sync"`.
+
+## 3. Continuous benchmarking in CI
+
+The `Benchmark` workflow (`.github/workflows/benchmark.yml`) runs the fio
+comparison on GitHub-hosted runners for a matrix of sync/async modes and
+1/8 threads:
+
+- Pull requests: add the `run-benchmark` label to trigger a benchmark run.
+  The results are compared against the baseline recorded on the
+  `bench-results` branch, and the comparison table is written to the job
+  summary of the workflow run (Actions tab).
+- Pushes to master: the results become the new baseline and are committed
+  to the orphan branch `bench-results`
+  (`results/<mode>-<threads>threads.json`).
+- Manual re-baselining: trigger the workflow via `workflow_dispatch` from
+  master, e.g. when the runner image changes.
+
+`tests/scripts/bench_compare.py` normalizes the fio JSON files
+(`collect`) and prints the markdown comparison table (`compare`); it can
+also be used to compare two local runs:
+
+```sh
+python3 tests/scripts/bench_compare.py collect /tmp/run1 sync run1-sync.json
+python3 tests/scripts/bench_compare.py compare base.json run1-sync.json
+```
+
+Note that GitHub-hosted runners are shared VMs with significant noise, so
+the comparison is advisory and never blocks merging. Regressions beyond
+the threshold (10%) should be re-checked on bare metal before acting on
+them; a dedicated runner may be used later by changing the workflow
+`runs-on` value.
 
 ## Interpretation
 

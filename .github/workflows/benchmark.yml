@@ -1,0 +1,162 @@
+# Benchmark the synchronous and asynchronous fusedev IO paths and compare
+# the results against the baseline recorded on the bench-results branch.
+#
+# Triggers:
+#   - pull requests: add the "run-benchmark" label to benchmark the PR.
+#     The report is written to the job summary of this workflow run.
+#   - pushes to master: the results become the new baseline, committed to
+#     the orphan branch bench-results (results/<mode>-<threads>threads.json).
+#   - workflow_dispatch: re-baseline manually; only dispatches from master
+#     update the baseline.
+#
+# Note that GitHub-hosted runners are shared VMs, so results are noisy.
+# The comparison is advisory and never fails the workflow; significant
+# regressions must be re-checked on bare metal.
+
+name: Benchmark
+
+on:
+  pull_request:
+    types: [labeled]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  bench:
+    if: github.event_name != 'pull_request' || github.event.label.name == 'run-benchmark'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        threads: [1, 8]
+    steps:
+    - uses: actions/checkout@v3
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2.2.0
+      with:
+        cache-on-failure: true
+
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        profile: minimal
+        toolchain: stable
+        override: true
+
+    - name: Install tools
+      run: |
+        if ! command -v fio >/dev/null || ! command -v jq >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y fio jq
+        fi
+
+    - name: Run benchmark
+      run: |
+        echo user_allow_other | sudo tee --append /etc/fuse.conf
+        mkdir -p "${GITHUB_WORKSPACE}/bench-results"
+        CARGO_HOME=${HOME}/.cargo
+        CARGO_BIN=$(which cargo)
+        sudo -E PATH="$(dirname "${CARGO_BIN}"):${PATH}" CARGO_HOME="${CARGO_HOME}" \
+            THREADS=${{ matrix.threads }} RUNTIME=30 MODES="sync async" \
+            RESULTS_DIR="${GITHUB_WORKSPACE}/bench-results" \
+            tests/scripts/bench_sync_async.sh
+        sudo chown -R $(id -u):$(id -g) "${HOME}/.cargo"
+
+    - name: Collect results
+      run: |
+        for mode in sync async; do
+            python3 tests/scripts/bench_compare.py collect \
+                "${GITHUB_WORKSPACE}/bench-results" "${mode}" \
+                "${GITHUB_WORKSPACE}/${mode}-${{ matrix.threads }}threads.json"
+        done
+
+    - name: Upload results
+      uses: actions/upload-artifact@v4
+      with:
+        name: bench-${{ matrix.threads }}threads
+        path: |
+          sync-${{ matrix.threads }}threads.json
+          async-${{ matrix.threads }}threads.json
+
+  report:
+    needs: bench
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Download results
+      uses: actions/download-artifact@v4
+      with:
+        pattern: bench-*threads
+        path: results
+
+    - name: Merge results
+      run: |
+        mkdir -p merged
+        for mode in sync async; do
+            for threads in 1 8; do
+                # Flatten the per-artifact directories into a single
+                # results/<mode>-<threads>threads.json layout.
+                cp "results/bench-${threads}threads/${mode}-${threads}threads.json" \
+                    "merged/${mode}-${threads}threads.json"
+            done
+        done
+
+    - name: Compare with baseline
+      if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+      run: |
+        if ! git ls-remote --exit-code --heads origin bench-results >/dev/null; then
+            echo "No baseline on the bench-results branch yet, skipping comparison." | tee -a "${GITHUB_STEP_SUMMARY}"
+            exit 0
+        fi
+        git fetch origin bench-results
+        git checkout -q FETCH_HEAD -- results || true
+        {
+            echo "## Benchmark results vs master baseline"
+            echo ""
+            for mode in sync async; do
+                for threads in 1 8; do
+                    baseline="results/${mode}-${threads}threads.json"
+                    if [ -f "${baseline}" ]; then
+                        python3 tests/scripts/bench_compare.py compare \
+                            "${baseline}" "merged/${mode}-${threads}threads.json"
+                    else
+                        echo "No baseline for ${mode} with ${threads} thread(s)."
+                        echo ""
+                    fi
+                done
+            done
+            echo "Regressions beyond the threshold (10%) are advisory: GitHub-hosted runners are noisy."
+        } >> "${GITHUB_STEP_SUMMARY}"
+
+    - name: Update baseline
+      if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        if git ls-remote --exit-code --heads origin bench-results >/dev/null; then
+            git fetch origin bench-results
+            git checkout -q -B bench-results FETCH_HEAD
+        else
+            git checkout -q --orphan bench-results
+            git rm -rfq .
+        fi
+        rm -rf results
+        mkdir -p results
+        cp merged/*.json results/
+        git add results/*.json
+        git commit -m "benchmark: update baseline
+
+Source: ${GITHUB_SHA}
+
+Signed-off-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+        git push origin bench-results
