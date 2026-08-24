@@ -170,6 +170,28 @@ impl Runtime {
             RuntimeType::Uring => tokio_uring::spawn(task),
         }
     }
+
+    /// Spawn a blocking task on the blocking thread pool, returning a [`JoinHandle`] for it.
+    ///
+    /// The async runtime used by this crate is single-threaded, so blocking operations
+    /// executed inline stall the processing of all other requests. Offload such work to
+    /// the tokio blocking thread pool with this method instead, so the async task can
+    /// keep serving requests while the blocking work runs on pool threads.
+    ///
+    /// Both runtime variants are backed by tokio runtimes, so the blocking pool is
+    /// available with both of them.
+    ///
+    /// This function must be called from the context of a `Runtime` object,
+    /// i.e. within the future passed to `Runtime::block_on()`.
+    ///
+    /// [`JoinHandle`]: tokio::task::JoinHandle
+    pub fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        tokio::task::spawn_blocking(f)
+    }
 }
 
 /// Start an async runtime.
@@ -210,6 +232,22 @@ pub fn block_on<F: Future>(f: F) -> F::Output {
 /// [`JoinHandle`]: tokio::task::JoinHandle
 pub fn spawn<T: std::future::Future + 'static>(task: T) -> tokio::task::JoinHandle<T::Output> {
     Runtime::spawn(task)
+}
+
+/// Spawn a blocking task on the blocking thread pool of the default `Runtime`,
+/// returning a [`JoinHandle`] for it.
+///
+/// See `Runtime::spawn_blocking()` for details. This function must be called
+/// from the context of a `Runtime` object, i.e. within the future passed to
+/// `Runtime::block_on()`.
+///
+/// [`JoinHandle`]: tokio::task::JoinHandle
+pub fn spawn_blocking<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    Runtime::spawn_blocking(f)
 }
 
 #[cfg(test)]
@@ -258,5 +296,43 @@ mod tests {
 
         let res = block_on(async { 3 });
         assert_eq!(res, 3);
+    }
+
+    #[test]
+    fn test_spawn_blocking() {
+        let main_tid = std::thread::current().id();
+
+        // The closure must run to completion on a thread of the blocking pool,
+        // not on the thread driving the runtime.
+        let (tid, res) = block_on(async {
+            let handle = Runtime::spawn_blocking(|| {
+                // Simulate a blocking syscall, which must not stall the
+                // async runtime thread.
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                (std::thread::current().id(), 42)
+            });
+            handle.await.unwrap()
+        });
+        assert_ne!(tid, main_tid);
+        assert_eq!(res, 42);
+
+        // Concurrent blocking tasks must run in parallel on pool threads.
+        let tids = block_on(async {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                handles.push(spawn_blocking(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::current().id()
+                }));
+            }
+            let mut tids = Vec::new();
+            for h in handles {
+                tids.push(h.await.unwrap());
+            }
+            tids
+        });
+        tids.iter().for_each(|t| assert_ne!(*t, main_tid));
+        let distinct: std::collections::HashSet<std::thread::ThreadId> = tids.into_iter().collect();
+        assert!(distinct.len() >= 2);
     }
 }
