@@ -154,9 +154,7 @@ jobs:
         mkdir -p results
         cp merged/*.json results/
         git add results/*.json
-        git commit -m "benchmark: update baseline
-
-Source: ${GITHUB_SHA}
-
-Signed-off-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+        git commit -m "benchmark: update baseline" \
+            -m "Source: ${GITHUB_SHA}" \
+            -m "Signed-off-by: github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
         git push origin bench-results
