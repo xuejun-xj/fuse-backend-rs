@@ -835,7 +835,7 @@ mod async_io {
             buf: FileVolatileBuf,
             offset: u64,
         ) -> (Result<usize>, FileVolatileBuf) {
-            self.async_read_at_volatile(buf, offset).await
+            <T as AsyncFileReadWriteVolatile>::async_read_at_volatile(&**self, buf, offset).await
         }
 
         async fn async_read_vectored_at_volatile(
@@ -843,7 +843,10 @@ mod async_io {
             bufs: Vec<FileVolatileBuf>,
             offset: u64,
         ) -> (Result<usize>, Vec<FileVolatileBuf>) {
-            self.async_read_vectored_at_volatile(bufs, offset).await
+            <T as AsyncFileReadWriteVolatile>::async_read_vectored_at_volatile(
+                &**self, bufs, offset,
+            )
+            .await
         }
 
         async fn async_write_at_volatile(
@@ -851,7 +854,7 @@ mod async_io {
             buf: FileVolatileBuf,
             offset: u64,
         ) -> (Result<usize>, FileVolatileBuf) {
-            self.async_write_at_volatile(buf, offset).await
+            <T as AsyncFileReadWriteVolatile>::async_write_at_volatile(&**self, buf, offset).await
         }
 
         async fn async_write_vectored_at_volatile(
@@ -859,7 +862,10 @@ mod async_io {
             bufs: Vec<FileVolatileBuf>,
             offset: u64,
         ) -> (Result<usize>, Vec<FileVolatileBuf>) {
-            self.async_write_vectored_at_volatile(bufs, offset).await
+            <T as AsyncFileReadWriteVolatile>::async_write_vectored_at_volatile(
+                &**self, bufs, offset,
+            )
+            .await
         }
     }
 
