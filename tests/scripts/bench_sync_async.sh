@@ -19,7 +19,9 @@
 #   THREADS  number of sync worker threads / fio jobs (default 4)
 #   SIZE     file size for the sequential workloads (default 256M)
 #   RUNTIME  seconds per time-based workload (default 30)
-#   NRFILES  number of files for the metadata workloads (default 10000)
+#   NRFILES  number of files for the metadata workloads (default 50000);
+#            large enough that each metadata workload runs for several
+#            seconds, since sub-second measurements are noise dominated
 #   MODES    execution order of the modes (default "sync async"); the
 #            second mode benefits from a warmer page cache, so run both
 #            orders to cross-check the results
@@ -37,7 +39,7 @@ DAEMON="${REPO_DIR}/target/release/fuse-backend-rs-benchmark"
 THREADS=${THREADS:-4}
 SIZE=${SIZE:-256M}
 RUNTIME=${RUNTIME:-30}
-NRFILES=${NRFILES:-10000}
+NRFILES=${NRFILES:-50000}
 MODES=${MODES:-"sync async"}
 RESULTS_DIR=${RESULTS_DIR:-$(mktemp -d /tmp/fuse-bench-results.XXXXXX)}
 SRC_DIR="${RESULTS_DIR}/source"
@@ -51,7 +53,8 @@ command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
 # holds an open handle per file as well, but the default soft fd limit of
 # GitHub-hosted runners (1024) is far too low for that, so raise the soft
 # limit to the hard limit; fio otherwise fails with
-# "try reducing/setting openfiles".
+# "try reducing/setting openfiles". Note that fio and the daemon each need
+# NRFILES descriptors, so the hard limit must cover both.
 if ! ulimit -S -n "$(ulimit -H -n)"; then
     echo "warning: could not raise the fd limit" >&2
 fi
@@ -100,6 +103,9 @@ run_workload() {
     local name=$2
     shift 2
     echo "--- [${mode}] ${name}: $*"
+    # Flush dirty pages so that writeback of earlier workloads does not
+    # interfere with this measurement.
+    sync
     fio --name="${name}" --directory="${MNT_DIR}" --group_reporting \
         --time_based --runtime="${RUNTIME}" "$@" \
         --output-format=json \
@@ -126,6 +132,7 @@ run_fixed_workload() {
     local name=$2
     shift 2
     echo "--- [${mode}] ${name}: $*"
+    sync
     fio --name="${name}" --directory="${MNT_DIR}" --group_reporting "$@" \
         --output-format=json \
         --output="${RESULTS_DIR}/${mode}-${name}.json" || {
@@ -147,17 +154,19 @@ for mode in ${MODES}; do
     echo "############ mode: ${mode} ############"
     start_daemon "${mode_args}"
 
-    # Sequential IO with large requests (throughput oriented).
+    # Sequential IO with large requests (throughput oriented). ramp_time
+    # excludes cold-start effects (first touches, daemon caches warming up)
+    # from the measurement.
     run_workload "${mode}" seqwrite --rw=write --bs=1M --size="${SIZE}" \
-        --numjobs="${THREADS}" --ioengine=psync
+        --numjobs="${THREADS}" --ioengine=psync --ramp_time=2
     run_workload "${mode}" seqread --rw=read --bs=1M --size="${SIZE}" \
-        --numjobs="${THREADS}" --ioengine=psync
+        --numjobs="${THREADS}" --ioengine=psync --ramp_time=2
 
     # Random IO with small requests (latency/metadata oriented).
     run_workload "${mode}" randwrite-4k --rw=randwrite --bs=4k --size=64M \
-        --numjobs="${THREADS}" --ioengine=psync
+        --numjobs="${THREADS}" --ioengine=psync --ramp_time=2
     run_workload "${mode}" randread-4k --rw=randread --bs=4k --size=64M \
-        --numjobs="${THREADS}" --ioengine=psync
+        --numjobs="${THREADS}" --ioengine=psync --ramp_time=2
 
     # Metadata operations: create and delete lots of small files. These run
     # for a fixed number of files instead of ${RUNTIME} seconds, see

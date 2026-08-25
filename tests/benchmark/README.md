@@ -77,9 +77,17 @@ python3 tests/scripts/bench_compare.py compare base.json run1-sync.json
 
 Note that GitHub-hosted runners are shared VMs with significant noise, so
 the comparison is advisory and never blocks merging. Regressions beyond
-the threshold (10%) should be re-checked on bare metal before acting on
-them; a dedicated runner may be used later by changing the workflow
-`runs-on` value.
+the threshold should be re-checked on bare metal before acting on them;
+a dedicated runner may be used later by changing the workflow `runs-on`
+value.
+
+Several measures keep the measurements stable: the data workloads use a
+2 second fio ramp phase to exclude cold-start effects, a `sync` flushes
+writeback between workloads, and the metadata workloads create/delete
+50000 files each so that they run long enough to measure reliably.
+Because the metadata workloads still fluctuate more than the data ones
+even on bare metal, they are flagged with a looser threshold (25% versus
+10%).
 
 ## Interpretation
 

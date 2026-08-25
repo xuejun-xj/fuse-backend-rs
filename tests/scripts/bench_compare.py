@@ -24,12 +24,21 @@ meaningful for the fixed-amount workloads (filecreate/filedelete).
 
 `compare` prints a markdown table and always exits with 0: shared CI
 runners are noisy, so the report is advisory and not a merge gate.
+The regression threshold defaults to --threshold for the data workloads,
+while the metadata workloads (filecreate/filedelete) use a higher fixed
+threshold because they are inherently noisier.
 """
 
 import argparse
 import json
 import os
 import sys
+
+# The metadata workloads fluctuate much more than the data workloads even
+# on bare metal (up to ~25% between runs of identical code), so flag them
+# with a looser threshold to keep the false-positive rate comparable.
+METADATA_WORKLOADS = ("filecreate", "filedelete")
+METADATA_THRESHOLD = 25.0
 
 
 def collect(results_dir, mode, out_path):
@@ -103,7 +112,10 @@ def compare(baseline_path, current_path, threshold):
             # For the fixed-amount metadata workloads a lower bandwidth or
             # IOPS means the same amount of work took longer, which is the
             # interesting signal; runtime is reported for reference only.
-            flag = "REGRESSION" if d < -threshold else ""
+            limit = threshold
+            if workload in METADATA_WORKLOADS:
+                limit = max(threshold, METADATA_THRESHOLD)
+            flag = "REGRESSION" if d < -limit else ""
             label = "BW(KiB/s)" if metric == "bw_kib" else "IOPS"
             print(
                 "| %s | %s | %s | %s | %+.1f%% | %s |"
@@ -120,7 +132,10 @@ def compare(baseline_path, current_path, threshold):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="cmd", required=True)
+    # No `required=True` here, it is only supported by Python >= 3.7 and
+    # the script is meant to run on bare metal machines with whatever
+    # python3 is available.
+    sub = parser.add_subparsers(dest="cmd")
 
     p_collect = sub.add_parser("collect", help="normalize fio JSON results")
     p_collect.add_argument("results_dir", help="directory with <mode>-<workload>.json files")
@@ -134,10 +149,15 @@ def main():
         "--threshold",
         type=float,
         default=10.0,
-        help="flag regressions beyond this percent (default: %(default)s)",
+        help="flag regressions of the data workloads beyond this percent; "
+        "the metadata workloads use at least %.0f%% (default: %%(default)s)"
+        % METADATA_THRESHOLD,
     )
 
     args = parser.parse_args()
+    if args.cmd is None:
+        parser.print_usage(sys.stderr)
+        return 2
     if args.cmd == "collect":
         collect(args.results_dir, args.mode, args.out)
     else:
