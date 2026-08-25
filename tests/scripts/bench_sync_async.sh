@@ -47,6 +47,15 @@ mkdir -p "${SRC_DIR}" "${MNT_DIR}"
 command -v fio >/dev/null 2>&1 || { echo "error: fio is required" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
 
+# The metadata workloads keep NRFILES files open at once, and the daemon
+# holds an open handle per file as well, but the default soft fd limit of
+# GitHub-hosted runners (1024) is far too low for that, so raise the soft
+# limit to the hard limit; fio otherwise fails with
+# "try reducing/setting openfiles".
+if ! ulimit -S -n "$(ulimit -H -n)"; then
+    echo "warning: could not raise the fd limit" >&2
+fi
+
 echo "results directory: ${RESULTS_DIR}"
 
 # Build the benchmark daemon in release mode.
