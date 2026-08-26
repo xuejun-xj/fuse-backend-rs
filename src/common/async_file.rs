@@ -4,10 +4,12 @@
 
 //! `File` to wrap over `tokio::fs::File` and `tokio-uring::fs::File`.
 
+use std::any::Any;
 use std::fmt::{Debug, Formatter};
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::async_runtime::{RuntimeType, RUNTIME_TYPE};
 use crate::file_buf::FileVolatileBuf;
@@ -20,6 +22,17 @@ pub enum File {
     #[cfg(target_os = "linux")]
     /// Tokio-uring asynchronous `File`.
     Uring(tokio_uring::fs::File),
+    /// A file descriptor borrowed from another object.
+    ///
+    /// The `_guard` reference must keep the descriptor valid for the whole
+    /// lifetime of the `File` object. Unlike the other variants, dropping
+    /// this object doesn't close the file descriptor.
+    Borrowed {
+        /// The borrowed file descriptor.
+        fd: RawFd,
+        /// A reference keeping the file descriptor valid.
+        _guard: Arc<dyn Any>,
+    },
 }
 
 impl File {
@@ -60,6 +73,15 @@ impl File {
         }
     }
 
+    /// Borrow an existing file descriptor to serve asynchronous IO.
+    ///
+    /// The returned object doesn't own the descriptor and doesn't close it
+    /// when dropped: `guard` must keep the descriptor valid for as long as
+    /// the returned object, and any IO submitted through it, lives.
+    pub fn borrow_fd(fd: RawFd, guard: Arc<dyn Any>) -> Self {
+        File::Borrowed { fd, _guard: guard }
+    }
+
     /// Asynchronously read data at `offset` into the buffer.
     pub async fn async_read_at(
         &self,
@@ -76,6 +98,20 @@ impl File {
             }
             #[cfg(target_os = "linux")]
             File::Uring(f) => f.read_at(buf, offset).await,
+            File::Borrowed { fd, .. } => {
+                #[cfg(target_os = "linux")]
+                if matches!(*RUNTIME_TYPE, RuntimeType::Uring) {
+                    // Safe because `fd` is valid for the lifetime of this
+                    // object, and the wrapper is forgotten on drop (including
+                    // cancellation of the IO) so it never closes the
+                    // borrowed descriptor.
+                    let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
+                    return ForgetOnDrop::new(file).read_at(buf, offset).await;
+                }
+                let mut bufs = [buf];
+                let res = preadv(*fd, &mut bufs, offset);
+                (res, bufs[0])
+            }
         }
     }
 
@@ -94,6 +130,19 @@ impl File {
             }
             #[cfg(target_os = "linux")]
             File::Uring(f) => f.readv_at(bufs, offset).await,
+            File::Borrowed { fd, .. } => {
+                #[cfg(target_os = "linux")]
+                if matches!(*RUNTIME_TYPE, RuntimeType::Uring) {
+                    // Safe because `fd` is valid for the lifetime of this
+                    // object, and the wrapper is forgotten on drop (including
+                    // cancellation of the IO) so it never closes the
+                    // borrowed descriptor.
+                    let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
+                    return ForgetOnDrop::new(file).readv_at(bufs, offset).await;
+                }
+                let res = preadv(*fd, &mut bufs, offset);
+                (res, bufs)
+            }
         }
     }
 
@@ -113,6 +162,20 @@ impl File {
             }
             #[cfg(target_os = "linux")]
             File::Uring(f) => f.write_at(buf, offset).await,
+            File::Borrowed { fd, .. } => {
+                #[cfg(target_os = "linux")]
+                if matches!(*RUNTIME_TYPE, RuntimeType::Uring) {
+                    // Safe because `fd` is valid for the lifetime of this
+                    // object, and the wrapper is forgotten on drop (including
+                    // cancellation of the IO) so it never closes the
+                    // borrowed descriptor.
+                    let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
+                    return ForgetOnDrop::new(file).write_at(buf, offset).await;
+                }
+                let bufs = [buf];
+                let res = pwritev(*fd, &bufs, offset);
+                (res, bufs[0])
+            }
         }
     }
 
@@ -131,6 +194,19 @@ impl File {
             }
             #[cfg(target_os = "linux")]
             File::Uring(f) => f.writev_at(bufs, offset).await,
+            File::Borrowed { fd, .. } => {
+                #[cfg(target_os = "linux")]
+                if matches!(*RUNTIME_TYPE, RuntimeType::Uring) {
+                    // Safe because `fd` is valid for the lifetime of this
+                    // object, and the wrapper is forgotten on drop (including
+                    // cancellation of the IO) so it never closes the
+                    // borrowed descriptor.
+                    let file = unsafe { tokio_uring::fs::File::from_raw_fd(*fd) };
+                    return ForgetOnDrop::new(file).writev_at(bufs, offset).await;
+                }
+                let res = pwritev(*fd, &bufs, offset);
+                (res, bufs)
+            }
         }
     }
 
@@ -160,6 +236,10 @@ impl File {
                     }))
                 }
             }
+            File::Borrowed { fd, _guard } => Ok(File::Borrowed {
+                fd: *fd,
+                _guard: _guard.clone(),
+            }),
         }
     }
 }
@@ -170,6 +250,7 @@ impl AsRawFd for File {
             File::Tokio(f) => f.as_raw_fd(),
             #[cfg(target_os = "linux")]
             File::Uring(f) => f.as_raw_fd(),
+            File::Borrowed { fd, .. } => *fd,
         }
     }
 }
@@ -178,6 +259,39 @@ impl Debug for File {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let fd = self.as_raw_fd();
         write!(f, "Async File {}", fd)
+    }
+}
+
+/// A wrapper which forgets its content instead of dropping it.
+///
+/// Used to wrap file objects created from borrowed descriptors, so that the
+/// descriptor is never closed, even when the asynchronous IO is cancelled
+/// and the future dropped in flight.
+#[cfg(target_os = "linux")]
+struct ForgetOnDrop<T>(Option<T>);
+
+#[cfg(target_os = "linux")]
+impl<T> ForgetOnDrop<T> {
+    fn new(value: T) -> Self {
+        ForgetOnDrop(Some(value))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<T> std::ops::Deref for ForgetOnDrop<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.0.as_ref().expect("value already consumed")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<T> Drop for ForgetOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            std::mem::forget(value);
+        }
     }
 }
 
@@ -412,6 +526,32 @@ mod tests {
             let res = std::fs::read_to_string(path.join("test.txt")).unwrap();
             assert_eq!(&res, "test");
         });
+    }
+
+    #[test]
+    fn test_borrow_fd() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().to_path_buf().join("test.txt");
+        std::fs::write(&path, b"test").unwrap();
+
+        // `owner` keeps the descriptor valid while the borrowed file lives.
+        let mut owner = std::fs::File::open(&path).unwrap();
+        let file = File::borrow_fd(owner.as_raw_fd(), Arc::new(()));
+
+        block_on(async {
+            let mut buffer = [0u8; 4];
+            let buf = unsafe { FileVolatileBuf::new(&mut buffer) };
+            let (res, buf) = file.async_read_at(buf, 0).await;
+            assert_eq!(res.unwrap(), 4);
+            assert_eq!(buf.len(), 4);
+            assert_eq!(&buffer, b"test");
+        });
+
+        // Dropping the borrowed file must not close the descriptor.
+        drop(file);
+        let mut buffer = [0u8; 4];
+        assert_eq!(std::io::Read::read(&mut owner, &mut buffer).unwrap(), 4);
+        assert_eq!(&buffer, b"test");
     }
 
     #[test]
