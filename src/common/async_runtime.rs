@@ -10,6 +10,12 @@
 //! which accepts `tokio` or `uring`. This is useful when asynchronous futures created
 //! by this crate (e.g. `FuseDevTask::poll_handler()`) are driven by the application's
 //! own tokio runtime, where `tokio-uring` objects can't be polled.
+//!
+//! Note: creating io-uring rings locks kernel memory accounted against `RLIMIT_MEMLOCK`
+//! (see `account_memlock()` in the kernel). If the limit is too low (e.g. the default
+//! 64KB), ring creation may fail with `ENOMEM`, in which case [`Runtime::new()`] panics
+//! with a hint. Raise the limit with e.g. `ulimit -l unlimited` or force the tokio
+//! runtime with `FUSE_BACKEND_RS_ASYNC_RUNTIME=tokio` instead.
 
 use std::future::Future;
 
@@ -17,6 +23,14 @@ use lazy_static::lazy_static;
 
 /// Environment variable to select the asynchronous runtime type, `tokio` or `uring`.
 pub const RUNTIME_TYPE_ENV: &str = "FUSE_BACKEND_RS_ASYNC_RUNTIME";
+
+/// Number of submission queue entries of the io-uring rings created by this crate.
+///
+/// Must match the value handed to `tokio_uring::builder()` in [`Runtime::new()`],
+/// so that `RuntimeType::probe_io_uring()` faithfully reflects the memory required
+/// to create a real runtime.
+#[cfg(target_os = "linux")]
+const RING_ENTRIES: u32 = 256;
 
 lazy_static! {
     pub(crate) static ref RUNTIME_TYPE: RuntimeType = RuntimeType::new();
@@ -57,6 +71,7 @@ impl RuntimeType {
             if Self::probe_io_uring() {
                 return Self::Uring;
             }
+            warn!("io-uring isn't available, falling back to the tokio runtime");
         }
         Self::Tokio
     }
@@ -74,9 +89,17 @@ impl RuntimeType {
     fn probe_io_uring() -> bool {
         use io_uring::{opcode, IoUring, Probe};
 
-        let io_uring = match IoUring::new(1) {
+        // Create the ring with the same number of entries as the real runtimes,
+        // because ring memory is accounted against `RLIMIT_MEMLOCK` and probing
+        // with a smaller ring may succeed where `Runtime::new()` would fail.
+        let io_uring = match IoUring::new(RING_ENTRIES) {
             Ok(io_uring) => io_uring,
-            Err(_) => {
+            Err(e) => {
+                warn!(
+                    "failed to create an io-uring instance with {} entries: {}. \
+                     Check `RLIMIT_MEMLOCK` if the error is ENOMEM",
+                    RING_ENTRIES, e
+                );
                 return false;
             }
         };
@@ -85,22 +108,26 @@ impl RuntimeType {
         let mut probe = Probe::new();
 
         // Check we can register a probe to validate supported operations.
-        if submitter.register_probe(&mut probe).is_err() {
+        if let Err(e) = submitter.register_probe(&mut probe) {
+            warn!("failed to register an io-uring probe: {}", e);
             return false;
         }
 
         // Check IORING_OP_FSYNC is supported
         if !probe.is_supported(opcode::Fsync::CODE) {
+            warn!("io-uring doesn't support the FSYNC operation");
             return false;
         }
 
         // Check IORING_OP_READ is supported
         if !probe.is_supported(opcode::Read::CODE) {
+            warn!("io-uring doesn't support the READ operation");
             return false;
         }
 
         // Check IORING_OP_WRITE is supported
         if !probe.is_supported(opcode::Write::CODE) {
+            warn!("io-uring doesn't support the WRITE operation");
             return false;
         }
         true
@@ -130,8 +157,24 @@ impl Runtime {
         // Check whether io-uring is available.
         #[cfg(target_os = "linux")]
         if matches!(*RUNTIME_TYPE, RuntimeType::Uring) {
-            if let Ok(rt) = tokio_uring::Runtime::new(&tokio_uring::builder()) {
-                return Runtime::Uring(std::sync::Mutex::new(rt));
+            // It's fine to use a ring with RING_ENTRIES entries here, because
+            // `RUNTIME_TYPE` has been set to `Uring` only after a ring of the
+            // same size was created successfully by `probe_io_uring()`.
+            match tokio_uring::Runtime::new(tokio_uring::builder().entries(RING_ENTRIES)) {
+                Ok(rt) => return Runtime::Uring(std::sync::Mutex::new(rt)),
+                Err(e) => {
+                    // Don't fall back to the tokio runtime here: `RUNTIME_TYPE` is
+                    // already published as `Uring`, so files are opened as io-uring
+                    // files and would panic or deadlock when polled by a plain tokio
+                    // runtime. Fail loudly instead.
+                    panic!(
+                        "failed to create a tokio-uring runtime: {}. io-uring was detected \
+                         at startup but ring creation failed now; check `RLIMIT_MEMLOCK` \
+                         (e.g. `ulimit -l`) if the error is ENOMEM, or force the tokio \
+                         runtime with {}=tokio",
+                        e, RUNTIME_TYPE_ENV
+                    );
+                }
             }
         }
 
