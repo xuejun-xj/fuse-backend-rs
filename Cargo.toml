@@ -36,6 +36,7 @@ arc-swap = "1.5"
 async-trait = { version = "0.1.42", optional = true }
 bitflags = "1.1"
 dbs-snapshot = { version = "1.5.2", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false, features = ["alloc"] }
 io-uring = { version = "0.5.8", optional = true }
 lazy_static = "1.4"
 libc = "0.2.68"
@@ -67,6 +68,7 @@ vm-memory = { version = "=0.17.1", features = ["backend-mmap", "backend-bitmap"]
 default = ["fusedev"]
 async-io = [
     "async-trait",
+    "futures-util",
     "tokio-uring",
     "tokio/fs",
     "tokio/sync",

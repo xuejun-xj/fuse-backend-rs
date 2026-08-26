@@ -716,9 +716,13 @@ pub use asyncio::FuseDevTask;
 #[cfg(feature = "async-io")]
 /// Task context to handle fuse request in asynchronous mode.
 mod asyncio {
-    use std::os::unix::io::AsRawFd;
+    use std::cell::{Cell, RefCell};
+    use std::os::unix::io::{AsRawFd, RawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
 
     use crate::api::filesystem::AsyncFileSystem;
     use crate::api::server::Server;
@@ -726,10 +730,64 @@ mod asyncio {
     use crate::file_buf::FileVolatileBuf;
     use crate::transport::{FuseBuf, FuseDevWriter, Reader};
 
+    /// Default limit on the number of concurrently processed requests.
+    ///
+    /// The limit bounds both the io_uring queue depth and the memory used by
+    /// the per-request buffers (one request buffer per in-flight request).
+    const DEFAULT_MAX_INFLIGHT: usize = 16;
+
+    /// Pool of reusable request buffers for pipelined request processing.
+    ///
+    /// Every in-flight request owns one buffer for its request data and
+    /// reply. Buffers are allocated lazily on first use and recycled through
+    /// the free list afterwards; once `max_inflight` buffers exist, no more
+    /// buffers are allocated, which also bounds the number of concurrently
+    /// processed requests and the memory used by them. When the pool is
+    /// exhausted, the caller serves in-flight requests first instead of
+    /// reading new ones (back pressure), and unread requests queue up in
+    /// the kernel, which throttles the clients on its own once its queues
+    /// fill up.
+    struct BufferPool {
+        free: RefCell<Vec<Vec<u8>>>,
+        created: Cell<usize>,
+        buf_size: usize,
+        max_inflight: usize,
+    }
+
+    impl BufferPool {
+        fn new(buf_size: usize, max_inflight: usize) -> Self {
+            BufferPool {
+                free: RefCell::new(Vec::new()),
+                created: Cell::new(0),
+                buf_size,
+                max_inflight: max_inflight.max(1),
+            }
+        }
+
+        /// Get a buffer from the pool, allocating a new one lazily if the
+        /// pool is empty but the limit hasn't been reached yet, or return
+        /// `None` if all buffers are in use.
+        fn try_acquire(&self) -> Option<Vec<u8>> {
+            if let Some(buf) = self.free.borrow_mut().pop() {
+                return Some(buf);
+            }
+            if self.created.get() < self.max_inflight {
+                self.created.set(self.created.get() + 1);
+                return Some(vec![0x0u8; self.buf_size]);
+            }
+            None
+        }
+
+        /// Return a buffer to the pool for reuse.
+        fn release(&self, buf: Vec<u8>) {
+            self.free.borrow_mut().push(buf);
+        }
+    }
+
     /// Task context to handle fuse request in asynchronous mode.
     ///
     /// This structure provides a context to handle fuse request in asynchronous mode, including
-    /// the fuse device file, a internal buffer and a `Server` instance to serve requests.
+    /// the fuse device file and a `Server` instance to serve requests.
     ///
     /// ## Examples
     /// ```text
@@ -746,23 +804,30 @@ mod asyncio {
     /// ```
     pub struct FuseDevTask<F: AsyncFileSystem + Sync> {
         file: AsyncFile,
-        buf: Vec<u8>,
         state: Arc<AtomicBool>,
         server: Arc<Server<F>>,
+        buf_size: usize,
+        max_inflight: usize,
     }
 
     impl<F: AsyncFileSystem + Sync> FuseDevTask<F> {
         /// Create a new fuse task context for asynchronous IO.
+        ///
+        /// The number of concurrently processed requests is limited to
+        /// `DEFAULT_MAX_INFLIGHT`, use `Self::new_with_max_inflight()` to
+        /// customize the limit.
         ///
         /// # Parameters
         /// - buf_size: size of buffer to receive requests from/send reply to the fuse fd.
         ///   It must be big enough to hold any request, at least
         ///   `crate::api::server::MAX_BUFFER_SIZE + 0x1000`, otherwise the kernel rejects
         ///   reads from the fuse device with `EINVAL` once the INIT handshake is done.
+        ///   Note that requests are processed concurrently, each with its own buffer of
+        ///   this size.
         /// - file: file object for the fuse device, ownership is taken by the task object
         /// - server: `Server` instance to serve requests from the fuse fd
         /// - state: shared flag to control the task object. The task stops picking up
-        ///   new requests once it's set to `true`; a request being processed is
+        ///   new requests once it's set to `true`; the requests being processed are
         ///   completed first.
         pub fn new(
             buf_size: usize,
@@ -770,11 +835,53 @@ mod asyncio {
             server: Arc<Server<F>>,
             state: Arc<AtomicBool>,
         ) -> Self {
+            Self::new_with_max_inflight(buf_size, file, server, state, DEFAULT_MAX_INFLIGHT)
+        }
+
+        /// Create a new fuse task context for asynchronous IO with a custom
+        /// limit on the number of concurrently processed requests.
+        ///
+        /// # Parameters
+        /// - buf_size, file, server, state: same as `Self::new()`.
+        /// - max_inflight: maximum number of requests processed concurrently.
+        ///   Each in-flight request owns one buffer of `buf_size` bytes, so
+        ///   this limit also bounds the memory used by the task. Values
+        ///   smaller than 1 are clamped to 1.
+        pub fn new_with_max_inflight(
+            buf_size: usize,
+            file: std::fs::File,
+            server: Arc<Server<F>>,
+            state: Arc<AtomicBool>,
+            max_inflight: usize,
+        ) -> Self {
+            // The fuse device fd is a file description without `O_NONBLOCK`
+            // (both freshly opened fds and fds cloned with `FUSE_DEV_IOC_CLONE`).
+            // Set it explicitly, because reads issued while no request is
+            // pending must not block the runtime thread:
+            // - with the io-uring runtime, io-uring submits reads inline on
+            //   fds without `O_NONBLOCK`, and `fuse_dev_do_read()` only honors
+            //   `O_NONBLOCK` (not `IOCB_NOWAIT`), so a blocking fd would stall
+            //   the io-uring submission thread. With `O_NONBLOCK` the read
+            //   fails with `EAGAIN` and io-uring waits for readiness via poll
+            //   instead.
+            // - with the tokio runtime, reads are issued with plain
+            //   `preadv()`, which would block the whole single-threaded
+            //   runtime (stalling in-flight request handling and teardown).
+            //   With `O_NONBLOCK` the read fails with `EAGAIN` and
+            //   `poll_handler()` yields and retries instead.
+            //
+            // Note: `O_NONBLOCK` is a property of the file description, so the
+            // fd must not be shared with other consumers of the same file
+            // description; the task takes ownership of `file` for this reason.
+            fcntl(file.as_raw_fd(), FcntlArg::F_SETFL(OFlag::O_NONBLOCK))
+                .expect("failed to set fuse device fd nonblocking");
+
             FuseDevTask {
                 file: AsyncFile::from_std_file(file),
                 server,
                 state,
-                buf: vec![0x0u8; buf_size],
+                buf_size,
+                max_inflight: max_inflight.max(1),
             }
         }
 
@@ -784,6 +891,27 @@ mod asyncio {
         /// - receiving request from fuse fd
         /// - handling requests by calling Server::async_handle_message()
         /// - sending reply to fuse fd
+        ///
+        /// Requests are processed concurrently: each request read from the fuse device
+        /// is turned into a request-handling future pushed into a `FuturesUnordered`
+        /// set, which is driven in parallel with reading the next request, so multiple
+        /// requests are in flight at the same time even though the runtime is
+        /// single-threaded. This allows the asynchronous IO engine (io_uring) to queue
+        /// and batch IO operations instead of serving them one by one. The number of
+        /// in-flight requests is bounded by the request buffer pool, and replies may
+        /// be sent out of order, which is fine because the kernel matches replies to
+        /// requests by their unique ids.
+        ///
+        /// The select loop is biased to complete in-flight requests before reading new
+        /// ones: unread requests just queue up in the kernel without consuming
+        /// userspace resources, while completed-but-unreplied requests pin request
+        /// buffers and keep clients waiting, so draining them first keeps the buffer
+        /// pool circulating and tail latency low. Note that a read issued on the fuse
+        /// device is never canceled once started: when the select loop turns to
+        /// in-flight work while a read is pending, the read is driven to completion
+        /// before the loop restarts, because the kernel may consume a request from
+        /// its queue into the read buffer at any point, and canceling the read
+        /// afterwards would silently lose that request.
         ///
         /// The async fn repeatedly return Poll::Pending when polled until the state has been set
         /// to quiesce mode, or the fuse session has been torn down (EOF/`ENODEV` from the
@@ -795,57 +923,93 @@ mod asyncio {
         /// `poll_handler()` as a separate task). Otherwise requests may pile up in the
         /// kernel without being served.
         pub async fn poll_handler(&mut self) {
-            // TODO: register self.buf as io uring buffers.
+            // TODO: register the request buffers as io uring buffers.
             let fd = self.file.as_raw_fd();
+            let pool = BufferPool::new(self.buf_size, self.max_inflight);
+            let mut inflight = FuturesUnordered::new();
 
-            while !self.state.load(Ordering::Acquire) {
-                // Safe because `vbuf` doesn't out-live `self.buf`.
-                let vbuf = unsafe { FileVolatileBuf::new(&mut self.buf) };
-                let (result, _vbuf) = self.file.async_read_at(vbuf, 0).await;
-                match result {
-                    Ok(0) => {
-                        // EOF, the fuse session has been torn down.
+            'serve: while !self.state.load(Ordering::Acquire) {
+                // Get a buffer for the next request. If the pool is exhausted,
+                // all buffers are held by in-flight requests, so make progress
+                // on those first (back pressure).
+                let mut buf = match pool.try_acquire() {
+                    Some(buf) => buf,
+                    None => {
+                        if let Some(buf) = inflight.next().await {
+                            pool.release(buf);
+                            continue 'serve;
+                        }
+                        // Unreachable: the pool never hands out more buffers
+                        // than it created, and every created buffer is either
+                        // in the free list or held by an in-flight request.
+                        error!("request buffer pool is empty without in-flight requests");
                         break;
                     }
-                    Ok(len) => {
-                        // ###############################################
-                        // Note: it's a heavy hack to reuse the same underlying data
-                        // buffer for both Reader and Writer, in order to reduce memory
-                        // consumption. Here we assume Reader won't be used anymore once
-                        // we start to write to the Writer. To get rid of this hack,
-                        // just allocate a dedicated data buffer for Writer.
-                        let buf = unsafe {
-                            std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len())
-                        };
-                        // Reader::from_fuse_buffer() and FuseDevWriter::new() should always
-                        // return success.
-                        let reader =
-                            Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut self.buf[0..len]))
-                                .unwrap();
-                        let writer = FuseDevWriter::<()>::new(fd, buf).unwrap();
-                        let result = unsafe {
-                            self.server
-                                .async_handle_message(reader, writer.into(), None, None)
-                                .await
-                        };
+                };
 
-                        if let Err(e) = result {
-                            // TODO: error handling
-                            error!("failed to handle fuse request, {}", e);
+                // The outcome of the read once it completes. Limit the scope
+                // of the read future, so that its borrow of `buf` ends before
+                // the buffer is handed over to a request or the pool.
+                let read_result = {
+                    // Safe because `vbuf` doesn't out-live `buf`.
+                    let vbuf = unsafe { FileVolatileBuf::new(&mut buf) };
+                    let read = self.file.async_read_at(vbuf, 0);
+                    tokio::pin!(read);
+
+                    loop {
+                        tokio::select! {
+                            biased;
+                            // Complete in-flight requests first, see the function doc.
+                            res = inflight.next(), if !inflight.is_empty() => {
+                                // Safe: the set is non-empty, so next() only returns
+                                // once a request future has completed.
+                                pool.release(res.unwrap());
+                            }
+                            (result, _vbuf) = &mut read => {
+                                break result;
+                            }
                         }
                     }
+                    // The read future has completed, so dropping it can't cancel
+                    // an in-flight read and lose a request anymore.
+                };
+
+                match read_result {
+                    Ok(0) => {
+                        // EOF, the fuse session has been torn down.
+                        pool.release(buf);
+                        break 'serve;
+                    }
+                    Ok(len) => {
+                        let server = self.server.clone();
+                        inflight.push(handle_request(server, fd, buf, len));
+                    }
                     Err(e) => {
+                        pool.release(buf);
                         match e.raw_os_error() {
                             Some(libc::ENODEV)
                             | Some(libc::ENOTCONN)
                             | Some(libc::ECONNABORTED) => {
-                                // The fuse device was unmounted or the
-                                // connection was aborted.
-                                break;
+                                // The fuse device was unmounted or the connection was aborted.
+                                break 'serve;
                             }
                             Some(libc::EINTR) => {
                                 // Interrupted by a signal, retry the read.
-                                continue;
+                                continue 'serve;
+                            }
+                            Some(libc::EAGAIN) => {
+                                // No request is pending and the io_uring
+                                // read was issued on the nonblocking fuse
+                                // fd. Some kernels complete the read with
+                                // `EAGAIN` instead of arming poll on the
+                                // fuse device, so retrying immediately
+                                // would busy-loop without ever letting the
+                                // runtime park (which is when io_uring
+                                // submissions and reactor events are
+                                // processed). Yield to the runtime before
+                                // retrying instead.
+                                tokio::task::yield_now().await;
+                                continue 'serve;
                             }
                             _ => {
                                 // TODO: error handling
@@ -856,8 +1020,47 @@ mod asyncio {
                 }
             }
 
-            // TODO: unregister self.buf as io uring buffers.
+            // Drain all in-flight requests before returning, so quiescing the
+            // task doesn't drop requests without a reply.
+            while let Some(buf) = inflight.next().await {
+                pool.release(buf);
+            }
+
+            // TODO: unregister the request buffers as io uring buffers.
         }
+    }
+
+    /// Serve one fuse request and send its reply, then hand the request buffer
+    /// back for reuse.
+    async fn handle_request<F: AsyncFileSystem + Sync>(
+        server: Arc<Server<F>>,
+        fd: RawFd,
+        mut buf: Vec<u8>,
+        len: usize,
+    ) -> Vec<u8> {
+        // ###############################################
+        // Note: it's a heavy hack to reuse the same underlying data
+        // buffer for both Reader and Writer, in order to reduce memory
+        // consumption. Here we assume Reader won't be used anymore once
+        // we start to write to the Writer. To get rid of this hack,
+        // just allocate a dedicated data buffer for Writer.
+        let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), buf.len()) };
+        // Reader::from_fuse_buffer() and FuseDevWriter::new() should always
+        // return success.
+        let reader = Reader::<()>::from_fuse_buffer(FuseBuf::new(&mut buf[0..len])).unwrap();
+        let writer = FuseDevWriter::<()>::new(fd, buf_slice).unwrap();
+        let result = unsafe {
+            server
+                .async_handle_message(reader, writer.into(), None, None)
+                .await
+        };
+
+        if let Err(e) = result {
+            // TODO: error handling
+            error!("failed to handle fuse request, {}", e);
+        }
+
+        buf
     }
 
     #[cfg(test)]
@@ -878,6 +1081,34 @@ mod asyncio {
             let mut task = FuseDevTask::new(0x1000, file, server, state);
 
             async_runtime::block_on(task.poll_handler());
+        }
+
+        #[test]
+        fn test_buffer_pool_limit() {
+            let pool = BufferPool::new(64, 2);
+
+            // Buffers are allocated lazily up to the limit...
+            let buf1 = pool.try_acquire().unwrap();
+            let buf2 = pool.try_acquire().unwrap();
+            assert_eq!(buf1.len(), 64);
+            assert_eq!(buf2.len(), 64);
+            // ...and no buffer is handed out once the limit is reached.
+            assert!(pool.try_acquire().is_none());
+
+            // Released buffers are recycled and handed out again.
+            pool.release(buf1);
+            let buf3 = pool.try_acquire().unwrap();
+            assert!(pool.try_acquire().is_none());
+            pool.release(buf2);
+            pool.release(buf3);
+        }
+
+        #[test]
+        fn test_buffer_pool_limit_clamped() {
+            // A limit of 0 is clamped to 1, so the pool stays usable.
+            let pool = BufferPool::new(64, 0);
+            assert!(pool.try_acquire().is_some());
+            assert!(pool.try_acquire().is_none());
         }
     }
 }
