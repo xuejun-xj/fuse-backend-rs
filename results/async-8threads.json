@@ -1,32 +1,32 @@
 {
   "filecreate": {
-    "bw_kib": 81466,
-    "iops": 20366.598778,
-    "runtime_ms": 491
+    "bw_kib": 78926,
+    "iops": 19731.649566,
+    "runtime_ms": 2534
   },
   "filedelete": {
-    "bw_kib": 29433,
-    "iops": 7358.351729,
-    "runtime_ms": 1359
+    "bw_kib": 27196,
+    "iops": 6799.020941,
+    "runtime_ms": 7354
   },
   "randread-4k": {
-    "bw_kib": 302780,
-    "iops": 75695.043499,
+    "bw_kib": 288910,
+    "iops": 72227.625746,
     "runtime_ms": 30001
   },
   "randwrite-4k": {
-    "bw_kib": 503385,
-    "iops": 125846.330734,
-    "runtime_ms": 30006
+    "bw_kib": 484206,
+    "iops": 121051.691385,
+    "runtime_ms": 30005
   },
   "seqread": {
-    "bw_kib": 2496185,
-    "iops": 2437.681159,
-    "runtime_ms": 30015
+    "bw_kib": 2499334,
+    "iops": 2440.755924,
+    "runtime_ms": 30003
   },
   "seqwrite": {
-    "bw_kib": 1736811,
-    "iops": 1696.105267,
-    "runtime_ms": 30323
+    "bw_kib": 1929633,
+    "iops": 1884.407706,
+    "runtime_ms": 30002
   }
 }
