@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Benchmark tooling for comparing the synchronous and asynchronous IO
-# paths of fuse-backend-rs. This is a standalone crate (like
+# Benchmark tooling for comparing the synchronous, asynchronous and
+# io_uring IO paths of fuse-backend-rs. This is a standalone crate (like
 # tests/passthrough) so that the benchmark dependencies don't leak into
 # the main crate's dependency tree or the CI test jobs.
 
 [dependencies]
-fuse-backend-rs = { path = "../../", default-features = false, features = ["fusedev", "async-io"] }
+fuse-backend-rs = { path = "../../", default-features = false, features = ["fusedev", "fusedev-uring", "async-io"] }
 log = ">=0.4.6"
 libc = ">=0.2.68"
 simple_logger = ">=1.13.0"

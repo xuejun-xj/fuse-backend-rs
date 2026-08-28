@@ -1,4 +1,4 @@
-# Benchmark the synchronous and asynchronous fusedev IO paths.
+# Benchmark the synchronous, asynchronous and io_uring fusedev IO paths.
 #
 # Triggers:
 #   - pull requests: add the "run-benchmark" label to benchmark the PR.
@@ -10,6 +10,14 @@
 #     produced "regressions" on code paths the PR did not touch.
 #   - pushes to master / workflow_dispatch: a single run, the collected
 #     results are written to the job summary for reference.
+#
+# The uring mode requires kernel 6.14+ with FUSE-over-io_uring enabled
+# (the fuse module parameter enable_uring defaults to off on several
+# distro kernels); the benchmark script turns it on when it can and
+# skips the mode when the kernel still rejects the transport.
+# The merge base predates the uring transport, so only the PR variant
+# runs that mode; its numbers are compared cross-mode against the
+# sync/async results of the same run, which needs no baseline.
 #
 # The comparison is advisory and never fails the workflow; significant
 # regressions must be re-checked on bare metal.
@@ -73,8 +81,12 @@ jobs:
     - name: Build the baseline daemon
       if: github.event_name == 'pull_request'
       run: |
-        # Same workspace target directory, so dependencies are built once.
-        (cd base-src/tests/benchmark && cargo build --release)
+        # cargo resolves the workspace root from the manifest being
+        # built, so without CARGO_TARGET_DIR the binary would land in
+        # base-src/target/. Build into the target directory of the main
+        # checkout instead: the binary ends up where cp expects it, and
+        # dependencies shared by both variants are compiled only once.
+        (cd base-src/tests/benchmark && CARGO_TARGET_DIR="${GITHUB_WORKSPACE}/target" cargo build --release)
         mkdir -p variants
         cp target/release/fuse-backend-rs-benchmark variants/daemon-base
 
@@ -90,11 +102,16 @@ jobs:
         CARGO_HOME=${HOME}/.cargo
         CARGO_BIN=$(which cargo)
         # Both variants are measured with this very script of the PR,
-        # so the workload definition is identical.
+        # so the workload definition is identical. The baseline daemon
+        # predates the uring transport and would reject --uring, so only
+        # the current variant runs that mode (the script itself skips it
+        # when the kernel does not accept FUSE-over-io_uring).
         SCRIPT=tests/scripts/bench_sync_async.sh
         run_variant() {
+            local modes="sync async"
+            [ "$1" = current ] && modes="sync async uring"
             sudo -E PATH="$(dirname "${CARGO_BIN}"):${PATH}" CARGO_HOME="${CARGO_HOME}" \
-                THREADS=${{ matrix.threads }} RUNTIME=30 MODES="sync async" \
+                THREADS=${{ matrix.threads }} RUNTIME=30 MODES="${modes}" \
                 DAEMON="${GITHUB_WORKSPACE}/variants/daemon-$1" \
                 RESULTS_DIR="${GITHUB_WORKSPACE}/bench-$1" \
                 "${SCRIPT}"
@@ -118,7 +135,10 @@ jobs:
       run: |
         for variant in current base; do
             [ -d "bench-${variant}" ] || continue
-            for mode in sync async; do
+            for mode in sync async uring; do
+                # The uring mode is skipped on kernels without FUSE_URING
+                # and never runs for the baseline variant.
+                compgen -G "bench-${variant}/${mode}-*.json" > /dev/null || continue
                 python3 tests/scripts/bench_compare.py collect \
                     "${GITHUB_WORKSPACE}/bench-${variant}" "${mode}" \
                     "${GITHUB_WORKSPACE}/${variant}-${mode}-${{ matrix.threads }}threads.json"
@@ -141,6 +161,27 @@ jobs:
             echo "GitHub-hosted runners drift over time even within one job."
         } >> "${GITHUB_STEP_SUMMARY}"
 
+        # Cross-mode comparison of the uring transport against the classic
+        # transports of this very PR run: same job and same machine, so
+        # environment effects cancel out, and no baseline is needed (the
+        # merge base predates the uring transport). Absent on runners
+        # whose kernels reject FUSE-over-io_uring.
+        URING_JSON="current-uring-${{ matrix.threads }}threads.json"
+        if [ -f "${URING_JSON}" ]; then
+            for mode in sync async; do
+                {
+                    echo ""
+                    echo "### Cross-mode comparison: uring vs ${mode} of this PR"
+                    echo ""
+                    echo "Positive deltas mean uring outperformed ${mode} on that workload."
+                    echo ""
+                } >> "${GITHUB_STEP_SUMMARY}"
+                python3 tests/scripts/bench_compare.py compare \
+                    "current-${mode}-${{ matrix.threads }}threads.json" \
+                    "${URING_JSON}" >> "${GITHUB_STEP_SUMMARY}"
+            done
+        fi
+
     - name: Show results
       if: github.event_name != 'pull_request'
       run: |
@@ -149,6 +190,11 @@ jobs:
             echo ""
             echo "Single run on the merge target, no comparison. See the"
             echo "artifacts for the raw fio results."
+            if [ -f "current-uring-${{ matrix.threads }}threads.json" ]; then
+                echo ""
+                echo "This runner's kernel supports FUSE_URING, so the run"
+                echo "covered the uring transport as well."
+            fi
         } >> "${GITHUB_STEP_SUMMARY}"
 
     - name: Upload results

@@ -3,17 +3,22 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 #
-# Compare the synchronous and asynchronous fusedev IO paths of
+# Compare the synchronous, asynchronous and io_uring fusedev IO paths of
 # fuse-backend-rs using fio.
 #
 # For each mode (sync: N worker threads, async: one FuseDevTask on the
-# async runtime), the script mounts the benchmark daemon and runs the same
-# fio workloads against the mountpoint. The fio results are stored in JSON
-# format ($RESULTS_DIR/<mode>-<workload>.json) under $RESULTS_DIR for
-# further analysis, see tests/scripts/bench_compare.py.
+# async runtime, uring: the experimental FUSE-over-io_uring transport),
+# the script mounts the benchmark daemon and runs the same fio workloads
+# against the mountpoint. The fio results are stored in JSON format
+# ($RESULTS_DIR/<mode>-<workload>.json) under $RESULTS_DIR for further
+# analysis, see tests/scripts/bench_compare.py.
 #
 # Requirements: Linux, fio, jq, permission to mount fuse (root or
-# fusermount).
+# fusermount). The uring mode additionally requires kernel 6.14+ with
+# FUSE-over-io_uring enabled (the fuse module parameter enable_uring,
+# which the script tries to turn on when it is writable); kernels that
+# reject the transport during the INIT handshake make the mode be
+# skipped with a warning.
 #
 # Tunables (environment variables):
 #   THREADS  number of sync worker threads / fio jobs (default 4)
@@ -50,8 +55,26 @@ SRC_DIR="${RESULTS_DIR}/source"
 MNT_DIR="${RESULTS_DIR}/mount"
 mkdir -p "${SRC_DIR}" "${MNT_DIR}"
 
+WORKLOADS="seqwrite seqread randwrite-4k randread-4k filecreate filedelete"
+
 command -v fio >/dev/null 2>&1 || { echo "error: fio is required" >&2; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo "error: jq is required" >&2; exit 1; }
+
+# kernel_at_least MAJOR MINOR: true if the running kernel is at least
+# MAJOR.MINOR. Used to gate the uring mode, which requires the kernel
+# FUSE_URING interface (6.14+).
+kernel_at_least() {
+    local want_major=$1 want_minor=$2 kv major minor
+    kv=$(uname -r)
+    major=${kv%%.*}
+    minor=${kv#*.}
+    minor=${minor%%.*}
+    case "${major}${minor}" in
+        *[!0-9]* | "") return 1 ;;
+    esac
+    [ "${major}" -gt "${want_major}" ] && return 0
+    [ "${major}" -eq "${want_major}" ] && [ "${minor}" -ge "${want_minor}" ]
+}
 
 # The metadata workloads keep NRFILES files open at once, and the daemon
 # holds an open handle per file as well, but the default soft fd limit of
@@ -82,19 +105,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# start_daemon <mode args>: launch the daemon and wait for the mount to
+# appear. Returns 1 when the daemon dies without serving (e.g. the kernel
+# rejects the FUSE-over-io_uring negotiation) or when the mount does not
+# appear in time; the caller decides whether that is fatal.
 start_daemon() {
     local mode_args=$1
     # shellcheck disable=SC2086
     "${DAEMON}" "${SRC_DIR}" "${MNT_DIR}" ${mode_args} --threads "${THREADS}" &
     DAEMON_PID=$!
     for _ in $(seq 50); do
+        # A daemon that mounted and immediately died (rejected session)
+        # leaves a stale mount behind; check aliveness before the
+        # mountpoint so that the stale mount is never taken as success.
+        if ! kill -0 "${DAEMON_PID}" 2>/dev/null; then
+            wait "${DAEMON_PID}" 2>/dev/null || true
+            DAEMON_PID=
+            return 1
+        fi
         if mountpoint -q "${MNT_DIR}"; then
             return 0
         fi
         sleep 0.1
     done
-    echo "error: daemon did not mount ${MNT_DIR}" >&2
-    exit 1
+    return 1
 }
 
 stop_daemon() {
@@ -157,10 +191,34 @@ run_fixed_workload() {
 for mode in ${MODES}; do
     mode_args=""
     [ "${mode}" = "async" ] && mode_args="--async"
+    if [ "${mode}" = "uring" ]; then
+        if ! kernel_at_least 6 14; then
+            echo "warning: mode uring requires kernel 6.14+ ($(uname -r)), skipping" >&2
+            continue
+        fi
+        # Kernels >= 6.14 may still reject FUSE-over-io_uring: the fuse
+        # module parameter enable_uring defaults to off on several distro
+        # kernels. Try to turn it on (best effort, a no-op without root or
+        # when the parameter does not exist); if the kernel keeps
+        # rejecting the transport the startup probe below skips the mode.
+        if [ -e /sys/module/fuse/parameters/enable_uring ]; then
+            ( echo 1 > /sys/module/fuse/parameters/enable_uring ) 2>/dev/null || true
+        fi
+        mode_args="--uring"
+    fi
 
     echo ""
     echo "############ mode: ${mode} ############"
-    start_daemon "${mode_args}"
+    if ! start_daemon "${mode_args}"; then
+        # Drop a possibly stale mount left by the failed daemon.
+        umount "${MNT_DIR}" 2>/dev/null || true
+        if [ "${mode}" = "uring" ]; then
+            echo "warning: FUSE-over-io_uring is not available on this kernel, skipping mode uring" >&2
+            continue
+        fi
+        echo "error: daemon did not mount ${MNT_DIR}" >&2
+        exit 1
+    fi
 
     # Sequential IO with large requests (throughput oriented). ramp_time
     # excludes cold-start effects (first touches, daemon caches warming up)
@@ -197,13 +255,20 @@ summarize() {
 
 echo ""
 echo "############ summary ############"
-printf "%-32s %-36s %-36s\n" "workload" "sync" "async"
-for f in "${RESULTS_DIR}"/sync-*.json; do
-    name=$(basename "${f}" .json)
-    name=${name#sync-}
-    printf "%-32s %-36s %-36s\n" "${name}" \
-        "$(summarize "${f}")" \
-        "$(summarize "${RESULTS_DIR}/async-${name}.json")"
+printf "%-32s" "workload"
+# shellcheck disable=SC2086
+for mode in ${MODES}; do
+    printf "%-36s" "${mode}"
+done
+printf "\n"
+# shellcheck disable=SC2086
+for name in ${WORKLOADS}; do
+    printf "%-32s" "${name}"
+    # shellcheck disable=SC2086
+    for mode in ${MODES}; do
+        printf "%-36s" "$(summarize "${RESULTS_DIR}/${mode}-${name}.json")"
+    done
+    printf "\n"
 done
 echo ""
 echo "full fio output: ${RESULTS_DIR}"

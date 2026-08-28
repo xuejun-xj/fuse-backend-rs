@@ -6,12 +6,15 @@
 //! A minimal fusedev passthrough daemon used to benchmark the synchronous
 //! and asynchronous IO paths with external tools such as fio.
 //!
-//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--threads N]`
+//! Usage: `fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N]`
 //!
 //! - default (sync) mode: requests are served by `N` worker threads, each
 //!   reading from its own fuse channel (the classic multi-threaded design).
 //! - `--async` mode: requests are served by a single `FuseDevTask` running
 //!   on the async runtime (tokio-uring when io_uring is available).
+//! - `--uring` mode: requests are served through the FUSE-over-io_uring
+//!   transport (`UringFuseServing`, experimental, requires kernel 6.14+);
+//!   `N` limits the number of io_uring worker threads.
 
 #[cfg(target_os = "linux")]
 mod daemon {
@@ -33,19 +36,22 @@ mod daemon {
     };
     use fuse_backend_rs::async_runtime::Runtime;
     use fuse_backend_rs::passthrough::{Config, PassthroughFs};
-    use fuse_backend_rs::transport::{FuseChannel, FuseDevTask, FuseSession};
+    use fuse_backend_rs::transport::{
+        FuseChannel, FuseDevTask, FuseSession, UringConfig, UringFuseServing,
+    };
 
     struct Args {
         src: String,
         dest: String,
         as_async: bool,
+        as_uring: bool,
         thread_cnt: u32,
         threads_set: bool,
     }
 
     fn help() {
         println!(
-            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async] [--threads N]\n"
+            "Usage:\n   fuse-backend-rs-benchmark <src> <mountpoint> [--async|--uring] [--threads N]\n"
         );
     }
 
@@ -59,6 +65,7 @@ mod daemon {
             src: args[1].clone(),
             dest: args[2].clone(),
             as_async: false,
+            as_uring: false,
             thread_cnt: 4,
             threads_set: false,
         };
@@ -66,6 +73,7 @@ mod daemon {
         while idx < args.len() {
             match args[idx].as_str() {
                 "--async" => res.as_async = true,
+                "--uring" => res.as_uring = true,
                 "--threads" => {
                     idx += 1;
                     if idx >= args.len() {
@@ -86,6 +94,10 @@ mod daemon {
             idx += 1;
         }
         if res.src.is_empty() || res.dest.is_empty() || res.thread_cnt == 0 {
+            help();
+            return Err(Error::from_raw_os_error(libc::EINVAL));
+        }
+        if res.as_async && res.as_uring {
             help();
             return Err(Error::from_raw_os_error(libc::EINVAL));
         }
@@ -208,6 +220,38 @@ mod daemon {
         state.store(true, Ordering::Release);
     }
 
+    /// Serve requests through the FUSE-over-io_uring transport until a
+    /// termination signal is received. Requires kernel 6.14+ with the
+    /// fuse module parameter enable_uring turned on; `UringFuseServing::new()`
+    /// fails otherwise.
+    fn run_uring(server: Arc<Server<Arc<Vfs>>>, se: FuseSession, thread_cnt: u32) {
+        // set_uring() must be called before the INIT handshake, which
+        // UringFuseServing::new() performs on the mounted session.
+        server.set_uring(true);
+        let cfg = UringConfig {
+            workers: thread_cnt as usize,
+            ..Default::default()
+        };
+        let serving = match UringFuseServing::new(se, server, cfg) {
+            Ok(serving) => serving,
+            Err(e) => {
+                error!(
+                    "failed to start the FUSE-over-io_uring transport \
+                     (requires kernel 6.14+ with the fuse module parameter \
+                     enable_uring turned on): {}",
+                    e
+                );
+                std::process::exit(1);
+            }
+        };
+
+        let mut signals = Signals::new(TERM_SIGNALS).unwrap();
+        signals.forever().next();
+        // Dropping the serving layer unmounts the session and joins all
+        // serving threads.
+        drop(serving);
+    }
+
     pub fn main() -> Result<()> {
         SimpleLogger::new()
             .with_level(LevelFilter::Info)
@@ -230,7 +274,13 @@ mod daemon {
             "passthrough src {} mountpoint {} mode {} threads {}",
             args.src,
             args.dest,
-            if args.as_async { "async" } else { "sync" },
+            if args.as_uring {
+                "uring"
+            } else if args.as_async {
+                "async"
+            } else {
+                "sync"
+            },
             args.thread_cnt,
         );
 
@@ -245,7 +295,9 @@ mod daemon {
             );
         }
 
-        if args.as_async {
+        if args.as_uring {
+            run_uring(server, se, args.thread_cnt);
+        } else if args.as_async {
             run_async(server, se);
         } else {
             run_sync(server, se, args.thread_cnt);
