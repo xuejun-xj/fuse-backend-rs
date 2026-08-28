@@ -97,11 +97,7 @@ fn parse_cpu_mask(content: &str) -> Result<usize> {
         let (start, end) = match range.as_slice() {
             [a] => (*a, *a),
             [a, b] => (*a, *b),
-            _ => {
-                return Err(SessionFailure(format!(
-                    "invalid cpu mask range: {part}"
-                )))
-            }
+            _ => return Err(SessionFailure(format!("invalid cpu mask range: {part}"))),
         };
         let start: usize = start
             .trim()
@@ -137,47 +133,47 @@ fn possible_cpu_count() -> Result<usize> {
 /// without a fixed header; `None` marks opcodes the daemon cannot serve.
 fn in_args_len(opcode: u32) -> Option<usize> {
     let len = match opcode {
-        1 => 0,             // LOOKUP: name only
-        2 => 8,             // FORGET: ForgetIn
-        3 => 16,            // GETATTR: GetattrIn
-        4 => 88,            // SETATTR: SetattrIn
-        5 => 0,             // READLINK: no arguments
-        6 => 0,             // SYMLINK: name + linkname
-        8 => 16,            // MKNOD: MknodIn
-        9 => 8,             // MKDIR: MkdirIn
-        10 | 11 => 0,       // UNLINK/RMDIR: name only
-        12 => 8,            // RENAME: RenameIn
-        13 => 8,            // LINK: LinkIn
-        14 => 8,            // OPEN: OpenIn
-        15 => 40,           // READ: ReadIn
-        16 => 40,           // WRITE: WriteIn
-        17 => 0,            // STATFS: no arguments
-        18 => 24,           // RELEASE: ReleaseIn
-        20 => 16,           // FSYNC: FsyncIn
-        21 => 8,            // SETXATTR: SetxattrIn
-        22 => 8,            // GETXATTR: GetxattrIn
-        23 => 8,            // LISTXATTR: GetxattrIn
-        24 => 0,            // REMOVEXATTR: name only
-        25 => 24,           // FLUSH: FlushIn
-        26 => 16,           // INIT: InitIn
-        27 => 8,            // OPENDIR: OpenIn
-        28 | 44 => 40,      // READDIR/READDIRPLUS: ReadIn
-        29 => 24,           // RELEASEDIR: ReleaseIn
-        30 => 16,           // FSYNCDIR: FsyncIn
-        31 | 32 | 33 => 48, // GETLK/SETLK/SETLKW: LkIn
-        34 => 8,            // ACCESS: AccessIn
-        35 => 16,           // CREATE: CreateIn
-        36 => 8,            // INTERRUPT: InterruptIn
-        37 => 16,           // BMAP: BmapIn
-        38 => 0,            // DESTROY: no arguments
-        39 => 32,           // IOCTL: IoctlIn
-        40 => 24,           // POLL: PollIn
-        41 => 0,            // NOTIFY_REPLY: payload only
-        42 => 8,            // BATCH_FORGET: BatchForgetIn
-        43 => 32,           // FALLOCATE: FallocateIn
-        45 => 16,           // RENAME2: Rename2In
-        46 => 24,           // LSEEK: LseekIn
-        47 => 56,           // COPY_FILE_RANGE: CopyFileRangeIn
+        1 => 0,        // LOOKUP: name only
+        2 => 8,        // FORGET: ForgetIn
+        3 => 16,       // GETATTR: GetattrIn
+        4 => 88,       // SETATTR: SetattrIn
+        5 => 0,        // READLINK: no arguments
+        6 => 0,        // SYMLINK: name + linkname
+        8 => 16,       // MKNOD: MknodIn
+        9 => 8,        // MKDIR: MkdirIn
+        10 | 11 => 0,  // UNLINK/RMDIR: name only
+        12 => 8,       // RENAME: RenameIn
+        13 => 8,       // LINK: LinkIn
+        14 => 8,       // OPEN: OpenIn
+        15 => 40,      // READ: ReadIn
+        16 => 40,      // WRITE: WriteIn
+        17 => 0,       // STATFS: no arguments
+        18 => 24,      // RELEASE: ReleaseIn
+        20 => 16,      // FSYNC: FsyncIn
+        21 => 8,       // SETXATTR: SetxattrIn
+        22 => 8,       // GETXATTR: GetxattrIn
+        23 => 8,       // LISTXATTR: GetxattrIn
+        24 => 0,       // REMOVEXATTR: name only
+        25 => 24,      // FLUSH: FlushIn
+        26 => 16,      // INIT: InitIn
+        27 => 8,       // OPENDIR: OpenIn
+        28 | 44 => 40, // READDIR/READDIRPLUS: ReadIn
+        29 => 24,      // RELEASEDIR: ReleaseIn
+        30 => 16,      // FSYNCDIR: FsyncIn
+        31..=33 => 48, // GETLK/SETLK/SETLKW: LkIn
+        34 => 8,       // ACCESS: AccessIn
+        35 => 16,      // CREATE: CreateIn
+        36 => 8,       // INTERRUPT: InterruptIn
+        37 => 16,      // BMAP: BmapIn
+        38 => 0,       // DESTROY: no arguments
+        39 => 32,      // IOCTL: IoctlIn
+        40 => 24,      // POLL: PollIn
+        41 => 0,       // NOTIFY_REPLY: payload only
+        42 => 8,       // BATCH_FORGET: BatchForgetIn
+        43 => 32,      // FALLOCATE: FallocateIn
+        45 => 16,      // RENAME2: Rename2In
+        46 => 24,      // LSEEK: LseekIn
+        47 => 56,      // COPY_FILE_RANGE: CopyFileRangeIn
         // SETUPMAPPING/REMOVEMAPPING only exist on the virtiofs DAX window
         // path and are never delivered through /dev/fuse, and opcodes 0, 7,
         // 19 and beyond 49 are undefined or reserved.
@@ -568,7 +564,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         // entry allocation and live for the duration of this function only.
         unsafe {
             let header = &*(base as *const FuseUringReqHeader);
-            let req = std::slice::from_raw_parts_mut(base.add(header_len + entry.payload_cap), scratch);
+            let req =
+                std::slice::from_raw_parts_mut(base.add(header_len + entry.payload_cap), scratch);
             let payload = std::slice::from_raw_parts(base.add(header_len), entry.payload_cap);
             let mut off = 0;
             req[off..off + IN_HEADER_SIZE].copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
@@ -584,7 +581,10 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             // Safe because the request and reply scratch regions are disjoint
             // and no other references to the entry exist in this scope.
             let reader = unsafe {
-                let req = std::slice::from_raw_parts_mut(base.add(header_len + entry.payload_cap), msg_len);
+                let req = std::slice::from_raw_parts_mut(
+                    base.add(header_len + entry.payload_cap),
+                    msg_len,
+                );
                 Reader::<()>::from_fuse_buffer(FuseBuf::new(req))?
             };
             let writer = unsafe {
@@ -626,7 +626,8 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
                 );
                 header.in_out[..OUT_HEADER_SIZE].copy_from_slice(&reply[..OUT_HEADER_SIZE]);
                 let payload_len = total - OUT_HEADER_SIZE;
-                let payload = std::slice::from_raw_parts_mut(base.add(header_len), entry.payload_cap);
+                let payload =
+                    std::slice::from_raw_parts_mut(base.add(header_len), entry.payload_cap);
                 payload[..payload_len].copy_from_slice(&reply[OUT_HEADER_SIZE..]);
                 header.ring_ent_in_out.payload_sz = payload_len as u32;
             }
@@ -815,5 +816,398 @@ impl<F: FileSystem + Send + Sync + 'static> Drop for UringFuseServing<F> {
         for handle in self.workers.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use vmm_sys_util::tempdir::TempDir;
+
+    use crate::abi::fuse_abi::{
+        AccessIn, AttrOut, BatchForgetIn, BmapIn, CopyFileRangeIn, CreateIn, EntryOut, FallocateIn,
+        FlushIn, ForgetIn, FsyncIn, GetattrIn, GetxattrIn, InHeader, InitIn, InterruptIn, IoctlIn,
+        LinkIn, LkIn, LseekIn, MkdirIn, MknodIn, Opcode, OpenIn, OutHeader, PollIn, ReadIn,
+        ReleaseIn, Rename2In, RenameIn, SetattrIn, SetxattrIn, WriteIn, ROOT_ID,
+    };
+    use crate::api::filesystem::FsOptions;
+    use crate::passthrough::{Config, PassthroughFs};
+
+    #[test]
+    fn test_parse_cpu_mask() {
+        assert_eq!(parse_cpu_mask("0").unwrap(), 1);
+        assert_eq!(parse_cpu_mask("0-3\n").unwrap(), 4);
+        assert_eq!(parse_cpu_mask("0-3,5,8-11").unwrap(), 9);
+        assert!(parse_cpu_mask("").is_err());
+        assert!(parse_cpu_mask("3-1").is_err());
+        assert!(parse_cpu_mask("a-b").is_err());
+        assert!(parse_cpu_mask("1-2-3").is_err());
+        assert!(possible_cpu_count().unwrap() >= 1);
+    }
+
+    #[test]
+    fn test_in_args_len() {
+        // Per-opcode argument sizes, derived from the *In structures of the
+        // fuse ABI (which mirror the kernel's first in_arg per opcode) and
+        // from the server-side request decoders.
+        let expected: &[(u32, usize)] = &[
+            (Opcode::Lookup as u32, 0),
+            (Opcode::Forget as u32, std::mem::size_of::<ForgetIn>()),
+            (Opcode::Getattr as u32, std::mem::size_of::<GetattrIn>()),
+            (Opcode::Setattr as u32, std::mem::size_of::<SetattrIn>()),
+            (Opcode::Readlink as u32, 0),
+            (Opcode::Symlink as u32, 0),
+            (Opcode::Mknod as u32, std::mem::size_of::<MknodIn>()),
+            (Opcode::Mkdir as u32, std::mem::size_of::<MkdirIn>()),
+            (Opcode::Unlink as u32, 0),
+            (Opcode::Rmdir as u32, 0),
+            (Opcode::Rename as u32, std::mem::size_of::<RenameIn>()),
+            (Opcode::Link as u32, std::mem::size_of::<LinkIn>()),
+            (Opcode::Open as u32, std::mem::size_of::<OpenIn>()),
+            (Opcode::Read as u32, std::mem::size_of::<ReadIn>()),
+            (Opcode::Write as u32, std::mem::size_of::<WriteIn>()),
+            (Opcode::Statfs as u32, 0),
+            (Opcode::Release as u32, std::mem::size_of::<ReleaseIn>()),
+            (Opcode::Fsync as u32, std::mem::size_of::<FsyncIn>()),
+            (Opcode::Setxattr as u32, std::mem::size_of::<SetxattrIn>()),
+            (Opcode::Getxattr as u32, std::mem::size_of::<GetxattrIn>()),
+            (Opcode::Listxattr as u32, std::mem::size_of::<GetxattrIn>()),
+            (Opcode::Removexattr as u32, 0),
+            (Opcode::Flush as u32, std::mem::size_of::<FlushIn>()),
+            (Opcode::Init as u32, std::mem::size_of::<InitIn>()),
+            (Opcode::Opendir as u32, std::mem::size_of::<OpenIn>()),
+            (Opcode::Readdir as u32, std::mem::size_of::<ReadIn>()),
+            (Opcode::Releasedir as u32, std::mem::size_of::<ReleaseIn>()),
+            (Opcode::Fsyncdir as u32, std::mem::size_of::<FsyncIn>()),
+            (Opcode::Getlk as u32, std::mem::size_of::<LkIn>()),
+            (Opcode::Setlk as u32, std::mem::size_of::<LkIn>()),
+            (Opcode::Setlkw as u32, std::mem::size_of::<LkIn>()),
+            (Opcode::Access as u32, std::mem::size_of::<AccessIn>()),
+            (Opcode::Create as u32, std::mem::size_of::<CreateIn>()),
+            (Opcode::Interrupt as u32, std::mem::size_of::<InterruptIn>()),
+            (Opcode::Bmap as u32, std::mem::size_of::<BmapIn>()),
+            (Opcode::Destroy as u32, 0),
+            (Opcode::Ioctl as u32, std::mem::size_of::<IoctlIn>()),
+            (Opcode::Poll as u32, std::mem::size_of::<PollIn>()),
+            (Opcode::NotifyReply as u32, 0),
+            (
+                Opcode::BatchForget as u32,
+                std::mem::size_of::<BatchForgetIn>(),
+            ),
+            (Opcode::Fallocate as u32, std::mem::size_of::<FallocateIn>()),
+            (Opcode::Readdirplus as u32, std::mem::size_of::<ReadIn>()),
+            (Opcode::Rename2 as u32, std::mem::size_of::<Rename2In>()),
+            (Opcode::Lseek as u32, std::mem::size_of::<LseekIn>()),
+            (
+                Opcode::CopyFileRange as u32,
+                std::mem::size_of::<CopyFileRangeIn>(),
+            ),
+        ];
+        for &(op, len) in expected {
+            assert_eq!(in_args_len(op), Some(len), "opcode {}", op);
+        }
+        // Everything else (holes, virtiofs-only and undefined opcodes)
+        // must be rejected.
+        for op in 0..=64u32 {
+            if !expected.iter().any(|&(e, _)| e == op) {
+                assert_eq!(in_args_len(op), None, "opcode {}", op);
+            }
+        }
+        assert_eq!(in_args_len(u32::MAX), None);
+    }
+
+    #[test]
+    fn test_uring_entry_layout() {
+        let payload_cap = 4096;
+        let entry = UringEntry::new(3, payload_cap);
+        assert_eq!(entry.qid, 3);
+
+        let header_len = std::mem::size_of::<FuseUringReqHeader>();
+        let total = header_len + payload_cap + 2 * (FUSE_HEADER_SIZE + payload_cap);
+        assert_eq!(entry.mem.len(), total);
+
+        // The iovec array must describe the header and payload areas of the
+        // same allocation, at stable addresses.
+        let base = entry.mem.as_ptr() as usize;
+        assert_eq!(entry.iovecs[0].iov_base as usize, base);
+        assert_eq!(entry.iovecs[0].iov_len, header_len);
+        assert_eq!(entry.iovecs[1].iov_base as usize, base + header_len);
+        assert_eq!(entry.iovecs[1].iov_len, payload_cap);
+
+        // All slots of the header must be reachable through the pointers.
+        assert_eq!(entry.header().ring_ent_in_out.payload_sz, 0);
+    }
+
+    #[test]
+    fn test_cmd_sqe() {
+        let entry = UringEntry::new(7, 64);
+        let sqe = entry.cmd_sqe(42, FUSE_IO_URING_CMD_REGISTER, 0xdead_beef, 5);
+
+        assert_eq!(
+            std::mem::size_of::<(SqeMirror, [u8; 64])>(),
+            std::mem::size_of::<squeue::Entry128>()
+        );
+        // Safe because of the size assertion above.
+        let (inner, extra): (SqeMirror, [u8; 64]) = unsafe { std::mem::transmute(sqe) };
+
+        // IORING_OP_URING_CMD as of kernel ABI 6.14.
+        assert_eq!(inner.opcode, 46);
+        assert_eq!(inner.fd, 42);
+        assert_eq!(inner.addr, entry.iovecs.as_ptr() as u64);
+        assert_eq!(inner.len, FUSE_URING_IOV_SEGS as u32);
+        assert_eq!(inner.user_data, 5);
+
+        // The io-uring crate splits the 80-byte command payload of an
+        // SQE128: the first 16 bytes are placed in the sqe cmd union
+        // (the addr3/__pad2 slots), the remaining 64 bytes in the extra
+        // area, so the payload is contiguous at sqe offsets 48..128 and
+        // io_uring_sqe128_cmd() reads it in one piece.
+        let mut cmd_bytes = [0u8; 80];
+        cmd_bytes[0..8].copy_from_slice(&inner.addr3.to_le_bytes());
+        cmd_bytes[8..16].copy_from_slice(&inner.pad2.to_le_bytes());
+        cmd_bytes[16..80].copy_from_slice(&extra);
+
+        // The command payload must carry the queue id and commit id.
+        let cmd = FuseUringCmdReq {
+            qid: 7,
+            commit_id: 0xdead_beef,
+            ..Default::default()
+        };
+        assert_eq!(
+            cmd_bytes[..std::mem::size_of::<FuseUringCmdReq>()],
+            *cmd.as_slice()
+        );
+    }
+
+    #[test]
+    fn test_uring_writer_basic() {
+        let mut scratch = vec![0u8; 128];
+        let mut w = UringWriter::<'_, ()>::new(&mut scratch);
+        assert_eq!(w.bytes_written(), 0);
+        assert_eq!(w.available_bytes(), 128);
+
+        w.write_obj(0x1234_5678u32).unwrap();
+        w.write_all(&[1u8, 2, 3]).unwrap();
+        assert_eq!(w.bytes_written(), 7);
+        assert_eq!(w.available_bytes(), 121);
+
+        // Writes beyond the available capacity must fail without
+        // overflowing the buffer.
+        let big = vec![0u8; 200];
+        assert!(w.write(&big).is_err());
+        assert!(w.write_all(&big).is_err());
+        assert_eq!(w.bytes_written(), 7);
+        assert_eq!(&scratch[..7], &[0x78, 0x56, 0x34, 0x12, 1, 2, 3]);
+    }
+
+    #[test]
+    fn test_uring_writer_split_commit() {
+        let mut scratch = vec![0u8; 64];
+        let mut w = UringWriter::<'_, ()>::new(&mut scratch);
+        w.write_all(&[1u8; 32]).unwrap();
+
+        let mut tail = w.split_at(16).unwrap();
+        assert_eq!(w.bytes_written(), 16);
+        assert_eq!(w.available_bytes(), 0);
+        assert_eq!(tail.bytes_written(), 16);
+        assert_eq!(tail.available_bytes(), 32);
+        tail.write_all(&[2u8; 8]).unwrap();
+
+        // commit() only accounts the staged bytes, it never touches a
+        // device.
+        let other = Writer::Uring(tail);
+        assert_eq!(w.commit(Some(&other)).unwrap(), 40);
+        // Splitting beyond the capacity is rejected.
+        assert!(w.split_at(17).is_err());
+
+        // The staged data must still be visible in the buffer.
+        assert_eq!(&scratch[..16], &[1u8; 16]);
+        assert_eq!(&scratch[16..32], &[1u8; 16]);
+        assert_eq!(&scratch[32..40], &[2u8; 8]);
+    }
+
+    #[test]
+    fn test_uring_writer_write_from_at() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("data");
+        std::fs::write(&path, (0..64).collect::<Vec<u8>>()).unwrap();
+
+        let mut scratch = vec![0u8; 32];
+        let mut w = UringWriter::<'_, ()>::new(&mut scratch);
+        let file = File::open(&path).unwrap();
+        assert_eq!(
+            w.write_from_at(file.try_clone().unwrap(), 16, 8).unwrap(),
+            16
+        );
+        assert_eq!(w.bytes_written(), 16);
+
+        // More data than available space must be rejected.
+        assert!(w.write_from_at(file, 32, 0).is_err());
+        assert_eq!(&scratch[..16], &(8..24).collect::<Vec<u8>>());
+    }
+
+    /// A worker over PassthroughFs, for exercising process() without a
+    /// kernel supporting FUSE_URING.
+    fn make_worker() -> (UringWorker<Arc<PassthroughFs<()>>>, TempDir) {
+        let source = TempDir::new().unwrap();
+        let cfg = Config {
+            root_dir: source.as_path().to_str().unwrap().to_string(),
+            do_import: true,
+            ..Default::default()
+        };
+        let fs = PassthroughFs::<()>::new(cfg).unwrap();
+        fs.import().unwrap();
+        fs.init(FsOptions::all()).unwrap();
+
+        let worker = UringWorker {
+            fd: File::open("/dev/null").unwrap(),
+            qids: vec![0],
+            entries_per_queue: 1,
+            payload_cap: 4096,
+            server: Arc::new(Server::new(Arc::new(fs))),
+        };
+        (worker, source)
+    }
+
+    /// Plant a request into the entry header/payload areas the way the
+    /// kernel does.
+    fn plant_request(entry: &mut UringEntry, opcode: u32, args: &[u8], payload: &[u8]) {
+        // Safe because getuid/getgid/getpid are always valid.
+        let (uid, gid, pid) = unsafe { (libc::getuid(), libc::getgid(), libc::getpid() as u32) };
+        let hdr = InHeader {
+            len: (IN_HEADER_SIZE + args.len() + payload.len()) as u32,
+            opcode,
+            unique: 2,
+            nodeid: ROOT_ID,
+            uid,
+            gid,
+            pid,
+            ..Default::default()
+        };
+
+        let header = entry.header_mut();
+        header.in_out[..IN_HEADER_SIZE].copy_from_slice(hdr.as_slice());
+        header.op_in[..args.len()].copy_from_slice(args);
+        let base = entry.mem.as_mut_ptr();
+        // Safe because the payload area is a disjoint part of the entry
+        // allocation and payload fits into payload_cap.
+        unsafe {
+            let header_len = std::mem::size_of::<FuseUringReqHeader>();
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), base.add(header_len), payload.len());
+        }
+        entry.header_mut().ring_ent_in_out.payload_sz = payload.len() as u32;
+        entry.header_mut().ring_ent_in_out.commit_id = 2;
+    }
+
+    fn parse_out_header(entry: &UringEntry) -> OutHeader {
+        let mut out = OutHeader::default();
+        out.as_mut_slice()
+            .copy_from_slice(&entry.header().in_out[..OUT_HEADER_SIZE]);
+        out
+    }
+
+    #[test]
+    fn test_process_getattr() {
+        let (worker, _source) = make_worker();
+        let mut entry = UringEntry::new(0, worker.payload_cap);
+
+        let args = GetattrIn::default();
+        plant_request(&mut entry, Opcode::Getattr as u32, args.as_slice(), &[]);
+        worker.process(&mut entry).unwrap();
+
+        let out = parse_out_header(&entry);
+        assert_eq!(out.error, 0);
+        assert_eq!(out.unique, 2);
+        // The reply body is staged in the payload area behind the
+        // fuse_out_header slot.
+        assert_eq!(
+            entry.header().ring_ent_in_out.payload_sz as usize,
+            std::mem::size_of::<AttrOut>()
+        );
+        assert_eq!(entry.header().ring_ent_in_out.commit_id, 2);
+    }
+
+    #[test]
+    fn test_process_lookup_payload_only() {
+        let (worker, _source) = make_worker();
+        let mut entry = UringEntry::new(0, worker.payload_cap);
+
+        // LOOKUP carries no fixed arguments, only the name in the payload.
+        plant_request(&mut entry, Opcode::Lookup as u32, &[], b"fuse-file\0");
+        // Lookup fails with ENOENT on the empty directory, which still
+        // exercises the payload reassembly; the reply must be an error.
+        worker.process(&mut entry).unwrap();
+        let out = parse_out_header(&entry);
+        assert_eq!(out.error, -libc::ENOENT);
+        assert_eq!(entry.header().ring_ent_in_out.payload_sz, 0);
+
+        // And succeeds once the file exists.
+        std::fs::write(_source.as_path().join("fuse-file"), "x").unwrap();
+        plant_request(&mut entry, Opcode::Lookup as u32, &[], b"fuse-file\0");
+        worker.process(&mut entry).unwrap();
+        let out = parse_out_header(&entry);
+        assert_eq!(out.error, 0);
+        assert_eq!(
+            entry.header().ring_ent_in_out.payload_sz as usize,
+            std::mem::size_of::<EntryOut>()
+        );
+    }
+
+    #[test]
+    fn test_process_rejects_invalid_requests() {
+        let (worker, _source) = make_worker();
+        let mut entry = UringEntry::new(0, worker.payload_cap);
+
+        // Undefined opcodes are rejected.
+        plant_request(&mut entry, 50, &[], &[]);
+        assert!(worker.process(&mut entry).is_err());
+
+        // A payload larger than the registered area is rejected.
+        plant_request(
+            &mut entry,
+            Opcode::Getattr as u32,
+            GetattrIn::default().as_slice(),
+            &[],
+        );
+        entry.header_mut().ring_ent_in_out.payload_sz = (worker.payload_cap + 1) as u32;
+        assert!(worker.process(&mut entry).is_err());
+    }
+
+    #[test]
+    fn test_stage_error_reply_after_rejected_request() {
+        let (worker, _source) = make_worker();
+        let mut entry = UringEntry::new(0, worker.payload_cap);
+
+        // Simulate the kernel delivering a request with an undefined
+        // opcode: process() fails, and the worker must commit a proper
+        // error reply rather than echoing the request data back.
+        plant_request(&mut entry, 50, &[], &[]);
+        assert!(worker.process(&mut entry).is_err());
+        entry.stage_error_reply();
+
+        let out = parse_out_header(&entry);
+        assert_eq!(out.len, OUT_HEADER_SIZE as u32);
+        assert_eq!(out.error, -libc::EIO);
+        assert_eq!(out.unique, 2);
+        assert_eq!(entry.header().ring_ent_in_out.payload_sz, 0);
+        // The commit_id delivered by the kernel must be preserved so that
+        // COMMIT_AND_FETCH matches the request.
+        assert_eq!(entry.header().ring_ent_in_out.commit_id, 2);
+    }
+
+    #[test]
+    fn test_process_rejects_oversized_reply() {
+        let (worker, _source) = make_worker();
+        // A payload area too small to hold the GETATTR reply body must be
+        // rejected instead of panicking in the staging copy.
+        let mut entry = UringEntry::new(0, 8);
+        plant_request(
+            &mut entry,
+            Opcode::Getattr as u32,
+            GetattrIn::default().as_slice(),
+            &[],
+        );
+        assert!(worker.process(&mut entry).is_err());
     }
 }
