@@ -25,6 +25,10 @@
 #   MODES    execution order of the modes (default "sync async"); the
 #            second mode benefits from a warmer page cache, so run both
 #            orders to cross-check the results
+#   DAEMON   path of a prebuilt benchmark daemon (default: build the
+#            daemon of this repository in release mode); used by the CI
+#            pipeline to benchmark different code variants with an
+#            identical workload definition
 #   RESULTS_DIR where to store results (default a fresh mktemp directory)
 
 set -euo pipefail
@@ -34,7 +38,7 @@ REPO_DIR=$(cd "${SCRIPT_DIR}/../.." && pwd)
 BENCH_DIR="${REPO_DIR}/tests/benchmark"
 # tests/benchmark is a member of the root workspace, so build artifacts
 # land in the workspace target directory, not under tests/benchmark.
-DAEMON="${REPO_DIR}/target/release/fuse-backend-rs-benchmark"
+DAEMON=${DAEMON:-"${REPO_DIR}/target/release/fuse-backend-rs-benchmark"}
 
 THREADS=${THREADS:-4}
 SIZE=${SIZE:-256M}
@@ -61,8 +65,12 @@ fi
 
 echo "results directory: ${RESULTS_DIR}"
 
-# Build the benchmark daemon in release mode.
-(cd "${BENCH_DIR}" && cargo build --release)
+# Build the benchmark daemon in release mode, unless the caller provided
+# a prebuilt one via $DAEMON (e.g. the CI pipeline benchmarking several
+# code variants with this very script).
+if [ ! -x "${DAEMON}" ]; then
+    (cd "${BENCH_DIR}" && cargo build --release)
+fi
 
 DAEMON_PID=
 cleanup() {

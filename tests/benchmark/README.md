@@ -57,14 +57,19 @@ comparison on GitHub-hosted runners for a matrix of sync/async modes and
 1/8 threads:
 
 - Pull requests: add the `run-benchmark` label to trigger a benchmark run.
-  The results are compared against the baseline recorded on the
-  `bench-results` branch, and the comparison table is written to the job
-  summary of the workflow run (Actions tab).
-- Pushes to master: the results become the new baseline and are committed
-  to the orphan branch `bench-results`
-  (`results/<mode>-<threads>threads.json`).
-- Manual re-baselining: trigger the workflow via `workflow_dispatch` from
-  master, e.g. when the runner image changes.
+  The merge base and the PR are built and benchmarked back to back *in the
+  same job*, and the two result sets are compared in the job summary of the
+  workflow run (Actions tab). The execution order of the two variants is
+  alternated between the thread counts to spread runner drift across them.
+- Pushes to master and manual dispatches run a single benchmark for
+  reference; no baseline is stored.
+
+An earlier revision compared each PR run against a baseline recorded on a
+different runner (the orphan branch `bench-results`). That approach turned
+out to be unusable: GitHub-hosted runners are shared VMs whose performance
+fluctuates by tens of percent, so even code paths the PR did not touch
+regularly showed "regressions" of 20% and more. Comparing two variants on
+the same runner cancels most of that noise.
 
 `tests/scripts/bench_compare.py` normalizes the fio JSON files
 (`collect`) and prints the markdown comparison table (`compare`); it can
