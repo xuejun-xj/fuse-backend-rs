@@ -772,6 +772,8 @@ impl<F: FileSystem + Sync> Server<F> {
                 };
 
                 let enabled = capable & want;
+                #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+                let enabled = self.apply_extra_init_flags(capable, enabled);
                 let enabled_flags = enabled.bits();
                 let mut out = InitOut {
                     major: KERNEL_VERSION,
@@ -1539,6 +1541,67 @@ mod tests {
 
             assert!(init_params_called);
             assert_eq!(res, 80);
+        }
+
+        #[cfg(feature = "fusedev-uring")]
+        #[test]
+        fn test_server_init_uring_negotiation() {
+            // Kernel capability set carrying INIT_EXT plus FUSE_OVER_IO_URING
+            // (bit 41, i.e. bit 9 of flags2), as sent by kernels >= 6.14:
+            // fuse_init_in followed by the full fuse_init_in2.
+            let mut read_buf = [0u8; size_of::<InitIn>() + size_of::<InitIn2>()];
+            let init_in = InitIn {
+                major: KERNEL_VERSION,
+                minor: KERNEL_MINOR_VERSION,
+                max_readahead: 0,
+                flags: (FsOptions::DO_READDIRPLUS | FsOptions::INIT_EXT).bits() as u32,
+            };
+            read_buf[..size_of::<InitIn>()].copy_from_slice(init_in.as_slice());
+            let init_in2 = InitIn2 {
+                flags2: (FsOptions::OVER_IO_URING.bits() >> 32) as u32,
+                unused: [0; 11],
+            };
+            read_buf[size_of::<InitIn>()..].copy_from_slice(init_in2.as_slice());
+
+            // With set_uring() the reply must echo FUSE_OVER_IO_URING in
+            // flags2 and set FUSE_INIT_EXT in flags, since kernels >= 6.13
+            // apply flags2 only when FUSE_INIT_EXT is present.
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Server::new(fs);
+            server.set_uring(true);
+            let mut write_buf = [0u8; 4096];
+            let (ctx, file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+            let res = server.init(ctx, |_| {}).unwrap();
+            assert_eq!(res, size_of::<OutHeader>() + size_of::<InitOut>());
+            // The reply is committed to the writer fd, not kept in the
+            // staging buffer.
+            let mut reply = vec![0u8; res];
+            std::os::unix::fs::FileExt::read_at(&file, &mut reply, 0).unwrap();
+            let mut out = InitOut::default();
+            out.as_mut_slice()
+                .copy_from_slice(&reply[size_of::<OutHeader>()..]);
+            assert_ne!(out.flags & FsOptions::INIT_EXT.bits() as u32, 0);
+            assert_ne!(
+                out.flags2 & (FsOptions::OVER_IO_URING.bits() >> 32) as u32,
+                0
+            );
+            assert!(server.uring_enabled());
+
+            // Without set_uring() the capability stays off and no upper bit
+            // is enabled, so INIT_EXT must not be advertised either.
+            let fs = PassthroughFs::<()>::new(Config::default()).unwrap();
+            let server = Server::new(fs);
+            let mut write_buf = [0u8; 4096];
+            let (ctx, file) = prepare_srvcontext(&mut read_buf, &mut write_buf);
+            let res = server.init(ctx, |_| {}).unwrap();
+            let mut reply = vec![0u8; res];
+            std::os::unix::fs::FileExt::read_at(&file, &mut reply, 0).unwrap();
+            let mut out = InitOut::default();
+            out.as_mut_slice()
+                .copy_from_slice(&reply[size_of::<OutHeader>()..]);
+            assert_eq!(out.flags & FsOptions::INIT_EXT.bits() as u32, 0);
+            assert_eq!(out.flags2, 0);
+            assert!(!server.uring_enabled());
         }
 
         #[test]

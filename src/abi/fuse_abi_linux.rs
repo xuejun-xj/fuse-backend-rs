@@ -200,6 +200,11 @@ const PERFILE_DAX: u64 = 0x2_0000_0000;
 // this flag indicates whether the guest kernel enable resend
 const HAS_RESEND: u64 = 1_u64 << 39;
 
+// Indicates that the daemon supports serving FUSE requests over io_uring
+// (protocol 7.42, kernel 6.14+, experimental fusedev-uring feature).
+#[cfg(feature = "fusedev-uring")]
+const OVER_IO_URING: u64 = 1_u64 << 41;
+
 // This flag indicates whether to enable fd-passthrough. It was defined in the
 // Anolis kernel but not in the upstream kernel. To avoid collision, we'll set
 // it to the most significant bit.
@@ -464,6 +469,10 @@ bitflags! {
 
         /// indicates whether the kernel support resend inflight request
         const HAS_RESEND = HAS_RESEND;
+
+        /// Daemon supports serving FUSE requests over io_uring (experimental).
+        #[cfg(feature = "fusedev-uring")]
+        const OVER_IO_URING = OVER_IO_URING;
     }
 }
 

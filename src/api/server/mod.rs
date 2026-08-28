@@ -29,6 +29,8 @@ use crate::api::filesystem::{Context, FileSystem, ZeroCopyReader, ZeroCopyWriter
 use crate::file_traits::FileReadWriteVolatile;
 use crate::transport::{Reader, Writer};
 use crate::{bytes_to_cstr, BitmapSlice, Error, Result};
+#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "async-io")]
 mod async_io;
@@ -51,6 +53,13 @@ pub const MAX_REQ_PAGES: u16 = 256; // 1MB
 pub struct Server<F: FileSystem + Sync> {
     fs: F,
     vers: ArcSwap<ServerVersion>,
+    /// Extra capability flags to advertise in the INIT reply, requested
+    /// through `set_uring()` (experimental fusedev-uring transport).
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    extra_init_flags: AtomicU64,
+    /// Capability flags actually enabled by the INIT exchange.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    negotiated_init_flags: AtomicU64,
 }
 
 impl<F: FileSystem + Sync> Server<F> {
@@ -62,7 +71,54 @@ impl<F: FileSystem + Sync> Server<F> {
                 major: KERNEL_VERSION,
                 minor: KERNEL_MINOR_VERSION,
             })),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            extra_init_flags: AtomicU64::new(0),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            negotiated_init_flags: AtomicU64::new(0),
         }
+    }
+
+    /// Request serving FUSE requests over io_uring (experimental).
+    ///
+    /// Must be called before the session is mounted: the request is carried
+    /// by the `FUSE_OVER_IO_URING` capability flag in the INIT reply. The
+    /// outcome of the negotiation is reported by `uring_enabled()`, which is
+    /// meaningful only after the INIT exchange has completed.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    pub fn set_uring(&self, enabled: bool) {
+        let flags = if enabled {
+            FsOptions::OVER_IO_URING.bits()
+        } else {
+            0
+        };
+        self.extra_init_flags.store(flags, Ordering::Relaxed);
+    }
+
+    /// Report whether the kernel accepted the `FUSE_OVER_IO_URING` capability
+    /// during the INIT exchange. Returns false before INIT completes.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    pub fn uring_enabled(&self) -> bool {
+        self.negotiated_init_flags.load(Ordering::Acquire) & FsOptions::OVER_IO_URING.bits() != 0
+    }
+
+    /// OR the extra INIT flags requested through `set_uring()` into the
+    /// enabled capability set and remember the negotiation outcome.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    fn apply_extra_init_flags(&self, capable: FsOptions, enabled: FsOptions) -> FsOptions {
+        let extra = FsOptions::from_bits_truncate(self.extra_init_flags.load(Ordering::Relaxed));
+        let mut enabled = enabled | (capable & extra);
+        // The kernel applies InitOut.flags2 (capability bits 32 and above)
+        // only if userspace also sets FUSE_INIT_EXT in the INIT reply, since
+        // the "fuse: Apply flags2 only when userspace set the FUSE_INIT_EXT"
+        // change in Linux 6.13. FUSE_OVER_IO_URING is bit 41 and therefore
+        // travels in flags2, so advertise INIT_EXT whenever any upper bit is
+        // enabled or the kernel would silently drop it.
+        if enabled.bits() >> 32 != 0 {
+            enabled |= FsOptions::INIT_EXT;
+        }
+        self.negotiated_init_flags
+            .store(enabled.bits(), Ordering::Release);
+        enabled
     }
 
     /// Remap the IDs in a request context to the IDs used by the backend
