@@ -16,6 +16,7 @@ build:
 check: build
 	${CARGO} fmt -- --check
 	${CARGO} clippy ${TARGET} --features="fusedev" --no-default-features -- -Dwarnings
+	${CARGO} clippy ${TARGET} --features="fusedev,fusedev-uring" --no-default-features -- -Dwarnings
 	${CARGO} clippy ${TARGET} --features="virtiofs" --no-default-features -- -Dwarnings
 	${CARGO} clippy ${TARGET} --features="vhost-user-fs" --no-default-features -- -Dwarnings
 	${CARGO} clippy ${TARGET} --features="fusedev,virtiofs" --no-default-features -- -Dwarnings

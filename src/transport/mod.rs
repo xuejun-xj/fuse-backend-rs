@@ -45,6 +45,8 @@ pub use self::fs_cache_req_handler::FsCacheReqHandler;
 pub use self::fusedev::FuseDevTask;
 #[cfg(feature = "fusedev")]
 pub use self::fusedev::{FuseBuf, FuseChannel, FuseDevWriter, FuseSession, FuseSessionExt};
+#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+pub use self::fusedev::{UringConfig, UringFuseServing, UringWriter};
 #[cfg(feature = "virtiofs")]
 pub use self::virtiofs::VirtioFsWriter;
 
@@ -535,6 +537,9 @@ pub enum Writer<'a, S: BitmapSlice = ()> {
     #[cfg(feature = "fusedev")]
     /// Writer for FuseDev transport driver.
     FuseDev(FuseDevWriter<'a, S>),
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    /// Buffer-only writer for the FUSE-over-io_uring transport.
+    Uring(UringWriter<'a, S>),
     #[cfg(feature = "virtiofs")]
     /// Writer for virtiofs transport driver.
     VirtioFs(VirtioFsWriter<'a, S>),
@@ -555,6 +560,8 @@ impl<S: BitmapSlice> Writer<'_, S> {
         match self {
             #[cfg(feature = "fusedev")]
             Writer::FuseDev(w) => w.write_from_at(src, count, off),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            Writer::Uring(w) => w.write_from_at(src, count, off),
             #[cfg(feature = "virtiofs")]
             Writer::VirtioFs(w) => w.write_from_at(src, count, off),
             _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
@@ -570,6 +577,8 @@ impl<S: BitmapSlice> Writer<'_, S> {
         match self {
             #[cfg(feature = "fusedev")]
             Writer::FuseDev(w) => w.split_at(offset).map(|w| w.into()),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            Writer::Uring(w) => w.split_at(offset).map(|w| w.into()),
             #[cfg(feature = "virtiofs")]
             Writer::VirtioFs(w) => w.split_at(offset).map(|w| w.into()),
             _ => Err(Error::InvalidParameter),
@@ -584,6 +593,8 @@ impl<S: BitmapSlice> Writer<'_, S> {
         match self {
             #[cfg(feature = "fusedev")]
             Writer::FuseDev(w) => w.available_bytes(),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            Writer::Uring(w) => w.available_bytes(),
             #[cfg(feature = "virtiofs")]
             Writer::VirtioFs(w) => w.available_bytes(),
             _ => 0,
@@ -595,6 +606,8 @@ impl<S: BitmapSlice> Writer<'_, S> {
         match self {
             #[cfg(feature = "fusedev")]
             Writer::FuseDev(w) => w.bytes_written(),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            Writer::Uring(w) => w.bytes_written(),
             #[cfg(feature = "virtiofs")]
             Writer::VirtioFs(w) => w.bytes_written(),
             _ => 0,
@@ -606,6 +619,8 @@ impl<S: BitmapSlice> Writer<'_, S> {
         match self {
             #[cfg(feature = "fusedev")]
             Writer::FuseDev(w) => w.commit(other),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            Writer::Uring(w) => w.commit(other),
             #[cfg(feature = "virtiofs")]
             Writer::VirtioFs(w) => w.commit(other),
             _ => Ok(0),
@@ -618,6 +633,8 @@ impl<S: BitmapSlice> io::Write for Writer<'_, S> {
         match self {
             #[cfg(feature = "fusedev")]
             Writer::FuseDev(w) => w.write(buf),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            Writer::Uring(w) => w.write(buf),
             #[cfg(feature = "virtiofs")]
             Writer::VirtioFs(w) => w.write(buf),
             _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
@@ -628,6 +645,8 @@ impl<S: BitmapSlice> io::Write for Writer<'_, S> {
         match self {
             #[cfg(feature = "fusedev")]
             Writer::FuseDev(w) => w.write_vectored(bufs),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            Writer::Uring(w) => w.write_vectored(bufs),
             #[cfg(feature = "virtiofs")]
             Writer::VirtioFs(w) => w.write_vectored(bufs),
             _ => Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
@@ -638,6 +657,8 @@ impl<S: BitmapSlice> io::Write for Writer<'_, S> {
         match self {
             #[cfg(feature = "fusedev")]
             Writer::FuseDev(w) => w.flush(),
+            #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+            Writer::Uring(w) => w.flush(),
             #[cfg(feature = "virtiofs")]
             Writer::VirtioFs(w) => w.flush(),
             _ => Ok(()),
@@ -730,6 +751,13 @@ impl<'a, S: BitmapSlice> Writer<'a, S> {
 impl<'a, S: BitmapSlice> From<FuseDevWriter<'a, S>> for Writer<'a, S> {
     fn from(w: FuseDevWriter<'a, S>) -> Self {
         Writer::FuseDev(w)
+    }
+}
+
+#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+impl<'a, S: BitmapSlice> From<UringWriter<'a, S>> for Writer<'a, S> {
+    fn from(w: UringWriter<'a, S>) -> Self {
+        Writer::Uring(w)
     }
 }
 

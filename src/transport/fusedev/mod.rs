@@ -37,6 +37,11 @@ mod fuse_t_session;
 #[cfg(all(target_os = "macos", feature = "fuse-t"))]
 pub use fuse_t_session::*;
 
+#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+mod uring_session;
+#[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+pub use uring_session::*;
+
 // These follow the definition from libfuse.
 /// Maximum size of FUSE message data, 1M with 4K page.
 pub const FUSE_KERN_BUF_PAGES: usize = 256;
