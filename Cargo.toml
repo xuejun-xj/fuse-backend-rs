@@ -81,6 +81,10 @@ virtiofs = ["virtio-queue", "caps", "vmm-sys-util"]
 vhost-user-fs = ["virtiofs", "vhost", "caps"]
 persist = ["dbs-snapshot", "versionize", "versionize_derive"]
 fuse-t = []
+# Experimental: FUSE-over-io_uring transport (kernel >= 6.14, protocol 7.42).
+# The kernel interface is still evolving (queue-count reduction, bufpool
+# extensions); the API and ABI target may change between releases.
+fusedev-uring = ["fusedev", "io-uring"]
 
 [package.metadata.docs.rs]
 all-features = true

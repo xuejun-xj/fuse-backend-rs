@@ -68,6 +68,10 @@ pub enum Error {
     #[cfg(feature = "fusedev")]
     /// Session errors
     SessionFailure(String),
+    #[cfg(feature = "fusedev-uring")]
+    /// FUSE-over-io_uring is not available: the kernel rejected the
+    /// `FUSE_OVER_IO_URING` init flag or uring registration failed.
+    UringNotSupported,
     #[cfg(feature = "virtiofs")]
     /// Failed to access guest memory.
     GuestMemoryError(vm_memory::GuestMemoryError),
@@ -94,6 +98,12 @@ impl fmt::Display for Error {
 
             #[cfg(feature = "fusedev")]
             SessionFailure(e) => write!(f, "fuse session failure: {e}"),
+
+            #[cfg(feature = "fusedev-uring")]
+            UringNotSupported => write!(
+                f,
+                "FUSE-over-io_uring is not available on this kernel or was rejected"
+            ),
 
             #[cfg(feature = "virtiofs")]
             ConvertIndirectDescriptor(e) => write!(f, "invalid indirect descriptor: {e}"),
