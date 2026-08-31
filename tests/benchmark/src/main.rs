@@ -230,7 +230,7 @@ mod daemon {
         server.set_uring(true);
         let cfg = UringConfig {
             workers: thread_cnt as usize,
-            ..Default::default()
+            entries_per_queue: 16,
         };
         let serving = match UringFuseServing::new(se, server, cfg) {
             Ok(serving) => serving,

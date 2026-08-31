@@ -538,7 +538,8 @@ pub enum Writer<'a, S: BitmapSlice = ()> {
     /// Writer for FuseDev transport driver.
     FuseDev(FuseDevWriter<'a, S>),
     #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
-    /// Buffer-only writer for the FUSE-over-io_uring transport.
+    /// Scatter writer for the FUSE-over-io_uring transport that routes the
+    /// reply header and body into separate ring entry areas.
     Uring(UringWriter<'a, S>),
     #[cfg(feature = "virtiofs")]
     /// Writer for virtiofs transport driver.

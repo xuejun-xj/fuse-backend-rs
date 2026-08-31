@@ -182,99 +182,151 @@ fn in_args_len(opcode: u32) -> Option<usize> {
     Some(len)
 }
 
-/// A buffer-only [Writer] for io_uring replies.
+/// A [Writer] for io_uring replies that routes the reply header and body
+/// into separate ring entry areas, eliminating the reply-staging memcpy.
 ///
-/// The reply is fully staged in memory; staging is completed by the caller
-/// copying the staged bytes into the ring entry areas, so `commit()` only
-/// accounts the staged bytes instead of issuing a device write.
+/// The first `OUT_HEADER_SIZE` (16) bytes written go to `header` (which
+/// points at the entry's `in_out` slot — the `fuse_out_header` area). All
+/// subsequent bytes go to `body` (which points at the entry's payload area).
+///
+/// After `handle_message` returns, both regions contain the final reply and
+/// the entry is ready for `COMMIT_AND_FETCH` without any post-copy.
 #[derive(Debug, PartialEq, Eq)]
 pub struct UringWriter<'a, S: BitmapSlice = ()> {
-    buf: ManuallyDrop<Vec<u8>>,
+    /// Backed by the entry's `in_out` area; receives `fuse_out_header` (16 bytes).
+    header: ManuallyDrop<Vec<u8>>,
+    /// Backed by the entry's payload area; receives the reply body.
+    body: ManuallyDrop<Vec<u8>>,
     phantom: std::marker::PhantomData<&'a mut [S]>,
 }
 
 impl<'a, S: BitmapSlice> UringWriter<'a, S> {
-    /// Construct a new writer staging the reply in `buf`.
-    pub fn new(buf: &'a mut [u8]) -> Self {
-        let buf = unsafe { Vec::from_raw_parts(buf.as_mut_ptr(), 0, buf.len()) };
+    /// Construct a writer that routes the first `OUT_HEADER_SIZE` bytes
+    /// to `header_buf` and all subsequent bytes to `body_buf`.
+    pub fn new(header_buf: &'a mut [u8], body_buf: &'a mut [u8]) -> Self {
+        debug_assert!(
+            header_buf.len() >= OUT_HEADER_SIZE,
+            "header slot must hold at least fuse_out_header ({} bytes)",
+            OUT_HEADER_SIZE,
+        );
+        // Safe because ManuallyDrop prevents Vec from freeing externally-owned memory.
+        let header = unsafe {
+            ManuallyDrop::new(Vec::from_raw_parts(
+                header_buf.as_mut_ptr(),
+                0,
+                header_buf.len(),
+            ))
+        };
+        let body = unsafe {
+            ManuallyDrop::new(Vec::from_raw_parts(
+                body_buf.as_mut_ptr(),
+                0,
+                body_buf.len(),
+            ))
+        };
         UringWriter {
-            buf: ManuallyDrop::new(buf),
+            header,
+            body,
             phantom: std::marker::PhantomData,
         }
     }
 
-    /// Split the writer at the given offset, following the [Writer] semantics.
+    /// Split the writer at `offset` bytes of the combined (header + body)
+    /// capacity.
+    ///
+    /// The two regions are non-contiguous, so the split redistributes
+    /// capacity between `self` (first `offset` bytes) and the returned
+    /// writer (remainder). This supports the two patterns used by the
+    /// server:
+    ///
+    /// - `split_at(0)`: `self` becomes empty, returned writer keeps
+    ///   everything (used by notify helpers).
+    /// - `split_at(size_of::<OutHeader>())`: `self` keeps the header slot,
+    ///   returned writer gets the body slot (used by READ / READDIR).
     pub fn split_at(&mut self, offset: usize) -> Result<UringWriter<'a, S>> {
-        if self.buf.capacity() < offset {
+        let total_cap = self.header.capacity() + self.body.capacity();
+        if offset > total_cap {
             return Err(SplitOutOfBounds(offset));
         }
 
-        let (len1, len2) = if self.buf.len() > offset {
-            (offset, self.buf.len() - offset)
+        let hdr_cap = self.header.capacity();
+        let body_cap = self.body.capacity();
+        let hdr_ptr = self.header.as_mut_ptr();
+        let body_ptr = self.body.as_mut_ptr();
+
+        // Drain both Vecs (they must be empty for from_raw_parts reuse).
+        // Safety: both Vecs are freshly constructed with len=0.
+        unsafe {
+            self.header.set_len(0);
+            self.body.set_len(0);
+        }
+
+        if offset <= hdr_cap {
+            // Split falls within (or at the end of) the header region.
+            // self gets header[0..offset], returned gets header[offset..] + body.
+            let self_hdr = unsafe { ManuallyDrop::new(Vec::from_raw_parts(hdr_ptr, 0, offset)) };
+            let other_hdr = unsafe {
+                ManuallyDrop::new(Vec::from_raw_parts(
+                    hdr_ptr.add(offset),
+                    0,
+                    hdr_cap - offset,
+                ))
+            };
+            let other_body =
+                unsafe { ManuallyDrop::new(Vec::from_raw_parts(body_ptr, 0, body_cap)) };
+            self.header = self_hdr;
+            // self.body is already drained (len=0, cap=body_cap) — shrink it.
+            self.body = unsafe { ManuallyDrop::new(Vec::from_raw_parts(body_ptr, 0, 0)) };
+            Ok(UringWriter {
+                header: other_hdr,
+                body: other_body,
+                phantom: std::marker::PhantomData,
+            })
         } else {
-            (self.buf.len(), 0)
-        };
-        let cap2 = self.buf.capacity() - offset;
-        let ptr = self.buf.as_mut_ptr();
-
-        // Safe because both buffers refer to different parts of the same
-        // underlying buffer and never overlap.
-        self.buf = unsafe { ManuallyDrop::new(Vec::from_raw_parts(ptr, len1, offset)) };
-        let buf = unsafe { ManuallyDrop::new(Vec::from_raw_parts(ptr.add(offset), len2, cap2)) };
-
-        Ok(UringWriter {
-            buf,
-            phantom: std::marker::PhantomData,
-        })
+            // Split falls within the body region (offset > hdr_cap).
+            // self gets header + body[0..offset-hdr_cap],
+            // returned gets body[offset-hdr_cap..].
+            let body_split = offset - hdr_cap;
+            let other_body = unsafe {
+                ManuallyDrop::new(Vec::from_raw_parts(
+                    body_ptr.add(body_split),
+                    0,
+                    body_cap - body_split,
+                ))
+            };
+            // self keeps full header (already drained) and body[0..body_split].
+            self.body = unsafe { ManuallyDrop::new(Vec::from_raw_parts(body_ptr, 0, body_split)) };
+            Ok(UringWriter {
+                header: unsafe {
+                    ManuallyDrop::new(Vec::from_raw_parts(
+                        std::ptr::NonNull::dangling().as_ptr(),
+                        0,
+                        0,
+                    ))
+                },
+                body: other_body,
+                phantom: std::marker::PhantomData,
+            })
+        }
     }
 
-    /// Return the number of bytes already staged.
+    /// Total bytes written across both regions.
     pub fn bytes_written(&self) -> usize {
-        self.buf.len()
+        self.header.len() + self.body.len()
     }
 
-    /// Return the number of bytes available for staging.
+    /// Total capacity available across both regions.
     pub fn available_bytes(&self) -> usize {
-        self.buf.capacity() - self.buf.len()
+        (self.header.capacity() - self.header.len()) + (self.body.capacity() - self.body.len())
     }
 
-    /// Account the staged bytes of self and `other`.
+    /// Account the bytes written by self and an optional split-off partner.
     pub fn commit(&mut self, other: Option<&Writer<'a, S>>) -> io::Result<usize> {
         let o = match other {
             Some(Writer::Uring(w)) => w.bytes_written(),
             _ => 0,
         };
-        Ok(self.buf.len() + o)
-    }
-
-    /// Write an object to the writer.
-    pub fn write_obj<T: ByteValued>(&mut self, val: T) -> io::Result<()> {
-        self.write_all(val.as_slice())
-    }
-
-    /// Stage data read from a file descriptor at offset `off`.
-    pub fn write_from_at<F: FileReadWriteVolatile>(
-        &mut self,
-        mut src: F,
-        count: usize,
-        off: u64,
-    ) -> io::Result<usize> {
-        self.check_available_space(count)?;
-
-        let cnt = src.read_vectored_at_volatile(
-            // Safe because check_available_space() ensures the capacity.
-            unsafe {
-                &[FileVolatileSlice::from_raw_ptr(
-                    self.buf.as_mut_ptr().add(self.buf.len()),
-                    count,
-                )]
-            },
-            off,
-        )?;
-        let new_len = self.buf.len() + cnt;
-        // Safe because cnt <= count was checked above.
-        unsafe { self.buf.set_len(new_len) };
-        Ok(cnt)
+        Ok(self.bytes_written() + o)
     }
 
     fn check_available_space(&self, sz: usize) -> io::Result<()> {
@@ -284,30 +336,71 @@ impl<'a, S: BitmapSlice> UringWriter<'a, S> {
                 format!(
                     "data out of range, available {} requested {}",
                     self.available_bytes(),
-                    sz
+                    sz,
                 ),
             ))
         } else {
             Ok(())
         }
     }
+
+    /// Write data, routing the first `OUT_HEADER_SIZE` bytes to the header
+    /// region and the remainder to the body region.
+    fn scatter_write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.check_available_space(data.len())?;
+        let hdr_remaining = self.header.capacity() - self.header.len();
+        let to_hdr = data.len().min(hdr_remaining);
+        if to_hdr > 0 {
+            self.header.extend_from_slice(&data[..to_hdr]);
+        }
+        if to_hdr < data.len() {
+            self.body.extend_from_slice(&data[to_hdr..]);
+        }
+        Ok(data.len())
+    }
+
+    /// Stage data read from a file descriptor at offset `off` into the body
+    /// region. Must be called after the header has been fully written.
+    pub fn write_from_at<F: FileReadWriteVolatile>(
+        &mut self,
+        mut src: F,
+        count: usize,
+        off: u64,
+    ) -> io::Result<usize> {
+        self.check_available_space(count)?;
+        let cnt = src.read_vectored_at_volatile(
+            // Safe because check_available_space() ensures capacity.
+            unsafe {
+                &[FileVolatileSlice::from_raw_ptr(
+                    self.body.as_mut_ptr().add(self.body.len()),
+                    count,
+                )]
+            },
+            off,
+        )?;
+        let new_len = self.body.len() + cnt;
+        // Safe because cnt <= count was checked above.
+        unsafe { self.body.set_len(new_len) };
+        Ok(cnt)
+    }
 }
 
 impl<S: BitmapSlice> Write for UringWriter<'_, S> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.check_available_space(data.len())?;
-        self.buf.extend_from_slice(data);
-        Ok(data.len())
+        self.scatter_write(data)
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         let total = bufs.iter().fold(0, |acc, b| acc + b.len());
         self.check_available_space(total)?;
-        let count = bufs.iter().filter(|b| !b.is_empty()).fold(0, |acc, b| {
-            self.buf.extend_from_slice(b);
-            acc + b.len()
-        });
-        Ok(count)
+        let mut written = 0usize;
+        for b in bufs {
+            if b.is_empty() {
+                continue;
+            }
+            written += self.scatter_write(b)?;
+        }
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -315,8 +408,9 @@ impl<S: BitmapSlice> Write for UringWriter<'_, S> {
     }
 }
 
-// The buffer is owned by the caller; UringWriter only holds a `ManuallyDrop`
-// Vec shell over it, so dropping the writer never frees the memory.
+// Both buffers are owned by the caller (ring entry areas);
+// UringWriter holds ManuallyDrop Vec shells, so dropping
+// the writer never frees the memory.
 
 /// One ring entry: the memory areas the kernel reads/writes plus scratch
 /// regions used to reassemble requests and collect replies.
@@ -526,11 +620,11 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         }
     }
 
-    /// Handle one delivered request: reassemble the classic wire layout,
-    /// dispatch to the server and stage the reply into the entry areas.
+    /// Handle one delivered request: reassemble the header/args in the
+    /// request scratch, dispatch to the server with scatter types that
+    /// reference the entry's payload area directly (zero-copy on the data
+    /// path), and stage the reply straight into the entry areas.
     fn process(&self, entry: &mut UringEntry) -> Result<()> {
-        // Copy the request parts out first, so that the reply scratch region
-        // can be borrowed mutably afterwards without aliasing.
         let in_header: InHeader = {
             let header = entry.header();
             let mut hdr = InHeader::default();
@@ -552,48 +646,75 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
             )));
         }
 
-        let msg_len = IN_HEADER_SIZE + args_len + payload_sz;
         let header_len = std::mem::size_of::<FuseUringReqHeader>();
         let scratch = FUSE_HEADER_SIZE + entry.payload_cap;
         let base = entry.mem.as_mut_ptr();
 
-        // Reassemble the classic contiguous layout in the request scratch
-        // region: fuse_in_header + per-opcode arguments + payload.
+        // Assemble only the small header/args portion in the request scratch
+        // region (40 + args_len bytes). The payload (up to ~128K for large
+        // writes) stays in the entry's payload area and is read directly by
+        // the scatter Reader, eliminating the per-request payload memcpy.
         //
-        // Safe because all slices below address disjoint regions of the
+        // Safe because the slices below address disjoint regions of the
         // entry allocation and live for the duration of this function only.
         unsafe {
             let header = &*(base as *const FuseUringReqHeader);
-            let req =
+            let req_scratch =
                 std::slice::from_raw_parts_mut(base.add(header_len + entry.payload_cap), scratch);
-            let payload = std::slice::from_raw_parts(base.add(header_len), entry.payload_cap);
             let mut off = 0;
-            req[off..off + IN_HEADER_SIZE].copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
+            req_scratch[off..off + IN_HEADER_SIZE]
+                .copy_from_slice(&header.in_out[..IN_HEADER_SIZE]);
             off += IN_HEADER_SIZE;
-            req[off..off + args_len].copy_from_slice(&header.op_in[..args_len]);
-            off += args_len;
-            req[off..off + payload_sz].copy_from_slice(&payload[..payload_sz]);
-            // in_header.len describes the classic contiguous message.
-            req[..4].copy_from_slice(&(msg_len as u32).to_le_bytes());
+            req_scratch[off..off + args_len].copy_from_slice(&header.op_in[..args_len]);
         }
 
         let total = {
-            // Safe because the request and reply scratch regions are disjoint
-            // and no other references to the entry exist in this scope.
-            let reader = unsafe {
-                let req = std::slice::from_raw_parts_mut(
+            // Build a scatter Reader:
+            //   Buffer 1 (header scratch): InHeader + opcode args
+            //   Buffer 2 (entry payload area): request payload — only when
+            //     payload_sz > 0, avoiding a copy of up to ~128K.
+            //
+            // Build a scatter Writer:
+            //   Header slot (entry.in_out): fuse_out_header (16 bytes)
+            //   Body slot (entry payload area): reply body
+            // Both are written in place — no post-copy after handle_message.
+            let header_args_len = IN_HEADER_SIZE + args_len;
+            let header_scratch = unsafe {
+                std::slice::from_raw_parts_mut(
                     base.add(header_len + entry.payload_cap),
-                    msg_len,
-                );
-                Reader::<()>::from_fuse_buffer(FuseBuf::new(req))?
+                    header_args_len,
+                )
             };
-            let writer = unsafe {
-                let reply = std::slice::from_raw_parts_mut(
-                    base.add(header_len + entry.payload_cap + scratch),
-                    scratch,
-                );
-                UringWriter::new(reply)
+
+            let reader = if payload_sz > 0 {
+                // SAFETY: The Reader's buffer 2 and the Writer's body below
+                // both cover the entry's payload area (base + header_len).
+                // This is technically overlapping mutable borrows, but is
+                // sound because:
+                //   (1) The Reader is fully consumed during argument parsing
+                //       (before handle_message returns).
+                //   (2) The Writer only writes to the payload area during
+                //       reply construction (after the Reader is consumed).
+                //   (3) Both slices are constructed via raw pointers inside
+                //       unsafe blocks, so the borrow checker doesn't track
+                //       them across the handle_message call.
+                // A future refactor could eliminate this by using raw
+                // pointers in both Reader and Writer APIs.
+                let entry_payload =
+                    unsafe { std::slice::from_raw_parts_mut(base.add(header_len), payload_sz) };
+                Reader::<()>::from_uring_buffers(header_scratch, entry_payload)?
+            } else {
+                Reader::<()>::from_fuse_buffer(FuseBuf::new(header_scratch))?
             };
+
+            // The reply header goes into entry.in_out[0..OUT_HEADER_SIZE] and
+            // the reply body goes directly into the entry's payload area.
+            // See SAFETY comment above regarding overlap with Reader's buffer 2.
+            let in_out_header = unsafe { std::slice::from_raw_parts_mut(base, OUT_HEADER_SIZE) };
+            let payload_area =
+                unsafe { std::slice::from_raw_parts_mut(base.add(header_len), entry.payload_cap) };
+            let writer = UringWriter::<()>::new(in_out_header, payload_area);
+
             self.server
                 .handle_message(reader, Writer::Uring(writer), None, None)
                 .map_err(|e| {
@@ -605,32 +726,16 @@ impl<F: FileSystem + Send + Sync + 'static> UringWorker<F> {
         };
 
         if total > 0 {
-            // The staged reply must fit the entry header slot plus the
-            // payload area; anything larger cannot be committed.
+            // The scatter writer already placed the reply directly in the
+            // entry areas; just record the payload size and validate.
             if total < OUT_HEADER_SIZE || total > OUT_HEADER_SIZE + entry.payload_cap {
                 return Err(SessionFailure(format!(
                     "uring: malformed reply of {} bytes for unique 0x{:x}",
                     total, in_header.unique
                 )));
             }
-            // The staged reply starts with fuse_out_header; move it into the
-            // entry header slot and stage the rest in the payload area.
-            //
-            // Safe because all slices below address disjoint regions of the
-            // entry allocation.
-            unsafe {
-                let header = &mut *(base as *mut FuseUringReqHeader);
-                let reply = std::slice::from_raw_parts(
-                    base.add(header_len + entry.payload_cap + scratch),
-                    total,
-                );
-                header.in_out[..OUT_HEADER_SIZE].copy_from_slice(&reply[..OUT_HEADER_SIZE]);
-                let payload_len = total - OUT_HEADER_SIZE;
-                let payload =
-                    std::slice::from_raw_parts_mut(base.add(header_len), entry.payload_cap);
-                payload[..payload_len].copy_from_slice(&reply[OUT_HEADER_SIZE..]);
-                header.ring_ent_in_out.payload_sz = payload_len as u32;
-            }
+            let payload_len = total - OUT_HEADER_SIZE;
+            entry.header_mut().ring_ent_in_out.payload_sz = payload_len as u32;
         } else {
             // Forget-like requests carry no reply.
             entry.header_mut().ring_ent_in_out.payload_sz = 0;
@@ -661,7 +766,7 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
     /// accepted the capability, returning `Error::UringNotSupported`
     /// otherwise so that the caller can fall back to the classic transport.
     pub fn new(
-        session: FuseSession,
+        mut session: FuseSession,
         server: Arc<Server<F>>,
         cfg: UringConfig,
     ) -> Result<UringFuseServing<F>> {
@@ -742,11 +847,25 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
             match ready_rx.recv() {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => {
+                    // Signal workers to exit and join them before returning.
+                    exit.store(true, Ordering::Release);
+                    let _ = session.wake();
+                    let _ = session.umount();
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
                     return Err(SessionFailure(format!(
                         "uring: entry registration failed: {e}"
                     )));
                 }
                 Err(_) => {
+                    // Signal workers to exit and join them before returning.
+                    exit.store(true, Ordering::Release);
+                    let _ = session.wake();
+                    let _ = session.umount();
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
                     return Err(SessionFailure(
                         "uring: worker exited during registration".to_string(),
                     ));
@@ -755,13 +874,24 @@ impl<F: FileSystem + Send + Sync + 'static> UringFuseServing<F> {
         }
         let live = handles;
 
-        let fallback = thread::Builder::new()
+        let fallback = match thread::Builder::new()
             .name("uring-fallback".to_string())
             .spawn({
                 let exit = exit.clone();
                 move || Self::fallback_loop(fallback_ch, server, exit)
-            })
-            .map_err(|e| SessionFailure(format!("uring: spawn fallback thread: {e}")))?;
+            }) {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Signal workers to exit and join them before returning.
+                exit.store(true, Ordering::Release);
+                let _ = session.wake();
+                let _ = session.umount();
+                for handle in live {
+                    let _ = handle.join();
+                }
+                return Err(SessionFailure(format!("uring: spawn fallback thread: {e}")));
+            }
+        };
 
         Ok(UringFuseServing {
             session,
@@ -981,70 +1111,94 @@ mod tests {
     }
 
     #[test]
-    fn test_uring_writer_basic() {
-        let mut scratch = vec![0u8; 128];
-        let mut w = UringWriter::<'_, ()>::new(&mut scratch);
-        assert_eq!(w.bytes_written(), 0);
-        assert_eq!(w.available_bytes(), 128);
+    fn test_uring_writer_scatter_basic() {
+        // Header slot: 16 bytes (OUT_HEADER_SIZE); body slot: 128 bytes.
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 128];
 
-        w.write_obj(0x1234_5678u32).unwrap();
-        w.write_all(&[1u8, 2, 3]).unwrap();
-        assert_eq!(w.bytes_written(), 7);
-        assert_eq!(w.available_bytes(), 121);
+        {
+            let mut w = UringWriter::<'_, ()>::new(&mut hdr, &mut body);
+            assert_eq!(w.bytes_written(), 0);
+            assert_eq!(w.available_bytes(), OUT_HEADER_SIZE + 128);
 
-        // Writes beyond the available capacity must fail without
-        // overflowing the buffer.
-        let big = vec![0u8; 200];
-        assert!(w.write(&big).is_err());
-        assert!(w.write_all(&big).is_err());
-        assert_eq!(w.bytes_written(), 7);
-        assert_eq!(&scratch[..7], &[0x78, 0x56, 0x34, 0x12, 1, 2, 3]);
+            // First 16 bytes must land in the header slot.
+            w.write_all(&[0xAA; OUT_HEADER_SIZE]).unwrap();
+            assert_eq!(w.bytes_written(), OUT_HEADER_SIZE);
+
+            // Next bytes must spill into the body slot.
+            w.write_all(&[1u8, 2, 3]).unwrap();
+            assert_eq!(w.bytes_written(), OUT_HEADER_SIZE + 3);
+
+            // Writes beyond the available capacity must fail.
+            let big = vec![0u8; 200];
+            assert!(w.write(&big).is_err());
+            assert_eq!(w.bytes_written(), OUT_HEADER_SIZE + 3);
+        }
+
+        assert_eq!(&hdr[..], &[0xAA; OUT_HEADER_SIZE]);
+        assert_eq!(&body[..3], &[1, 2, 3]);
     }
 
     #[test]
-    fn test_uring_writer_split_commit() {
-        let mut scratch = vec![0u8; 64];
-        let mut w = UringWriter::<'_, ()>::new(&mut scratch);
-        w.write_all(&[1u8; 32]).unwrap();
+    fn test_uring_writer_scatter_single_write() {
+        // A single write() that straddles the header/body boundary.
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 64];
 
-        let mut tail = w.split_at(16).unwrap();
-        assert_eq!(w.bytes_written(), 16);
-        assert_eq!(w.available_bytes(), 0);
-        assert_eq!(tail.bytes_written(), 16);
-        assert_eq!(tail.available_bytes(), 32);
-        tail.write_all(&[2u8; 8]).unwrap();
+        {
+            let mut w = UringWriter::<'_, ()>::new(&mut hdr, &mut body);
+            let data: Vec<u8> = (0..48).collect();
+            w.write_all(&data).unwrap();
+            assert_eq!(w.bytes_written(), 48);
+        }
 
-        // commit() only accounts the staged bytes, it never touches a
-        // device.
-        let other = Writer::Uring(tail);
-        assert_eq!(w.commit(Some(&other)).unwrap(), 40);
-        // Splitting beyond the capacity is rejected.
-        assert!(w.split_at(17).is_err());
-
-        // The staged data must still be visible in the buffer.
-        assert_eq!(&scratch[..16], &[1u8; 16]);
-        assert_eq!(&scratch[16..32], &[1u8; 16]);
-        assert_eq!(&scratch[32..40], &[2u8; 8]);
+        // First 16 bytes → header
+        assert_eq!(&hdr[..], &(0..16).collect::<Vec<u8>>()[..]);
+        // Remaining 32 bytes → body
+        assert_eq!(&body[..32], &(16..48).collect::<Vec<u8>>()[..]);
     }
 
     #[test]
-    fn test_uring_writer_write_from_at() {
+    fn test_uring_writer_scatter_commit() {
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 64];
+        let mut w = UringWriter::<'_, ()>::new(&mut hdr, &mut body);
+        w.write_all(&[1u8; OUT_HEADER_SIZE]).unwrap();
+        w.write_all(&[2u8; 32]).unwrap();
+        assert_eq!(w.bytes_written(), OUT_HEADER_SIZE + 32);
+
+        // commit() accounts the staged bytes without touching a device.
+        assert_eq!(w.commit(None).unwrap(), OUT_HEADER_SIZE + 32);
+    }
+
+    #[test]
+    fn test_uring_writer_scatter_write_from_at() {
         let dir = TempDir::new().unwrap();
         let path = dir.as_path().join("data");
         std::fs::write(&path, (0..64).collect::<Vec<u8>>()).unwrap();
 
-        let mut scratch = vec![0u8; 32];
-        let mut w = UringWriter::<'_, ()>::new(&mut scratch);
-        let file = File::open(&path).unwrap();
-        assert_eq!(
-            w.write_from_at(file.try_clone().unwrap(), 16, 8).unwrap(),
-            16
-        );
-        assert_eq!(w.bytes_written(), 16);
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 32];
 
-        // More data than available space must be rejected.
-        assert!(w.write_from_at(file, 32, 0).is_err());
-        assert_eq!(&scratch[..16], &(8..24).collect::<Vec<u8>>());
+        {
+            let mut w = UringWriter::<'_, ()>::new(&mut hdr, &mut body);
+
+            // Write the header first so write_from_at lands in the body region.
+            w.write_all(&[0xFF; OUT_HEADER_SIZE]).unwrap();
+
+            let file = File::open(&path).unwrap();
+            assert_eq!(
+                w.write_from_at(file.try_clone().unwrap(), 16, 8).unwrap(),
+                16
+            );
+            assert_eq!(w.bytes_written(), OUT_HEADER_SIZE + 16);
+
+            // More data than available body space must be rejected.
+            assert!(w.write_from_at(file, 32, 0).is_err());
+        }
+
+        // Body should contain file data starting at offset 8.
+        assert_eq!(&body[..16], &(8..24).collect::<Vec<u8>>()[..]);
     }
 
     /// A worker over PassthroughFs, for exercising process() without a
@@ -1209,5 +1363,69 @@ mod tests {
             &[],
         );
         assert!(worker.process(&mut entry).is_err());
+    }
+
+    #[test]
+    fn test_uring_writer_split_at_zero() {
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 256];
+        let mut w = UringWriter::<()>::new(&mut hdr, &mut body);
+
+        // split_at(0): self becomes empty, other gets everything.
+        let other = w.split_at(0).unwrap();
+        assert_eq!(w.available_bytes(), 0);
+        assert_eq!(other.available_bytes(), OUT_HEADER_SIZE + 256);
+    }
+
+    #[test]
+    fn test_uring_writer_split_at_header_size() {
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 256];
+        let mut w = UringWriter::<()>::new(&mut hdr, &mut body);
+
+        // split_at(OUT_HEADER_SIZE): self keeps header, other gets body.
+        let mut other = w.split_at(OUT_HEADER_SIZE).unwrap();
+        assert_eq!(w.available_bytes(), OUT_HEADER_SIZE);
+        assert_eq!(other.available_bytes(), 256);
+
+        // Write OutHeader to self (header region).
+        let out = OutHeader {
+            len: (OUT_HEADER_SIZE + 10) as u32,
+            error: 0,
+            unique: 42,
+        };
+        w.write_all(out.as_slice()).unwrap();
+        assert_eq!(w.bytes_written(), OUT_HEADER_SIZE);
+
+        // Write data to other (body region).
+        other.write_all(&[0xABu8; 10]).unwrap();
+        assert_eq!(other.bytes_written(), 10);
+
+        // Commit combines both.
+        let total = w.commit(Some(&Writer::Uring(other))).unwrap();
+        assert_eq!(total, OUT_HEADER_SIZE + 10);
+    }
+
+    #[test]
+    fn test_uring_writer_split_at_beyond_capacity() {
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 64];
+        let mut w = UringWriter::<()>::new(&mut hdr, &mut body);
+
+        // split_at beyond total capacity must fail.
+        assert!(w.split_at(OUT_HEADER_SIZE + 65).is_err());
+    }
+
+    #[test]
+    fn test_uring_writer_split_at_body_offset() {
+        let mut hdr = vec![0u8; OUT_HEADER_SIZE];
+        let mut body = vec![0u8; 256];
+        let mut w = UringWriter::<()>::new(&mut hdr, &mut body);
+
+        // split_at beyond header into body region.
+        let offset = OUT_HEADER_SIZE + 100;
+        let other = w.split_at(offset).unwrap();
+        assert_eq!(w.available_bytes(), offset);
+        assert_eq!(other.available_bytes(), 256 - 100);
     }
 }

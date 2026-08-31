@@ -79,6 +79,35 @@ impl<'a, S: BitmapSlice + Default> Reader<'a, S> {
             },
         })
     }
+
+    /// Construct a scatter Reader spanning two non-contiguous buffers: a
+    /// header/args region followed by a separate payload region.
+    ///
+    /// Used by the FUSE-over-io_uring transport to avoid copying the request
+    /// payload (e.g. WRITE data) from the ring entry into a scratch buffer —
+    /// the Reader reads directly from the entry's payload area instead.
+    #[cfg(all(target_os = "linux", feature = "fusedev-uring"))]
+    pub fn from_uring_buffers(
+        header: &'a mut [u8],
+        payload: &'a mut [u8],
+    ) -> Result<Reader<'a, S>> {
+        let mut buffers: VecDeque<VolatileSlice<'a, S>> = VecDeque::new();
+        // Safe because Reader has the same lifetime as the input slices.
+        buffers.push_back(unsafe {
+            VolatileSlice::with_bitmap(header.as_mut_ptr(), header.len(), S::default(), None)
+        });
+        if !payload.is_empty() {
+            buffers.push_back(unsafe {
+                VolatileSlice::with_bitmap(payload.as_mut_ptr(), payload.len(), S::default(), None)
+            });
+        }
+        Ok(Reader {
+            buffers: IoBuffers {
+                buffers,
+                bytes_consumed: 0,
+            },
+        })
+    }
 }
 
 /// Writer to send FUSE reply to the FUSE driver.
