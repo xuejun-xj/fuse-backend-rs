@@ -258,6 +258,20 @@ impl FuseSession {
         }
     }
 
+    /// Create a new blocking fuse message channel.
+    ///
+    /// The channel receives requests with plain blocking reads on a fuse
+    /// device fd cloned with `FUSE_DEV_IOC_CLONE`, saving the `epoll_wait`
+    /// syscall per request that [`Self::new_channel()`] pays.
+    ///
+    /// Note: blocking channels are not woken by [`Self::wake()`]; they exit
+    /// when the fuse session is umounted (the pending read returns `ENODEV`).
+    /// Requires kernel support for `FUSE_DEV_IOC_CLONE` (kernel >= 4.2).
+    pub fn new_blocking_channel(&self) -> Result<BlockingFuseChannel> {
+        let file = self.clone_fuse_file()?;
+        Ok(BlockingFuseChannel::new(file, self.bufsize))
+    }
+
     /// Wake channel loop and exit
     pub fn wake(&self) -> Result<()> {
         let wakers = self
@@ -423,6 +437,87 @@ impl FuseChannel {
                         }
                     },
                 }
+            }
+        }
+    }
+}
+
+/// A fuse channel that receives requests with plain blocking reads.
+///
+/// Compared to [`FuseChannel`], this channel saves the `epoll_wait` syscall
+/// per request by reading the fuse device fd directly, at the cost of losing
+/// wakeup-based shutdown: [`FuseSession::wake()`] has no effect on blocking
+/// channels. A blocking channel exits instead when the fuse connection is
+/// torn down (unmount or abort), which makes the pending read fail with
+/// `ENODEV` and [`Self::get_request()`] return `Ok(None)`.
+///
+/// Blocking channels are created from a fuse device fd cloned with
+/// `FUSE_DEV_IOC_CLONE`, which has its own file description and is thus
+/// unaffected by the `O_NONBLOCK` flag set on the session fd.
+pub struct BlockingFuseChannel {
+    file: File,
+    buf: Vec<u8>,
+}
+
+impl BlockingFuseChannel {
+    fn new(file: File, bufsize: usize) -> Self {
+        BlockingFuseChannel {
+            file,
+            buf: vec![0x0u8; bufsize],
+        }
+    }
+
+    /// Get next available FUSE request from the underlying fuse device file.
+    ///
+    /// Blocks until a request arrives or the fuse connection is torn down.
+    ///
+    /// Returns:
+    /// - Ok(None): the fuse session has been umounted or aborted
+    /// - Ok(Some((reader, writer))): reader to receive request and writer to send reply
+    /// - Err(e): error message
+    pub fn get_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
+        loop {
+            let fd = self.file.as_raw_fd();
+            match read(fd, &mut self.buf) {
+                Ok(len) => {
+                    // ###############################################
+                    // Note: it's a heavy hack to reuse the same underlying data
+                    // buffer for both Reader and Writer, in order to reduce memory
+                    // consumption. Here we assume Reader won't be used anymore once
+                    // we start to write to the Writer. To get rid of this hack,
+                    // just allocate a dedicated data buffer for Writer.
+                    let buf = unsafe {
+                        std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), self.buf.len())
+                    };
+                    // Reader::new() and Writer::new() should always return success.
+                    let reader =
+                        Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..len])).unwrap();
+                    let writer = FuseDevWriter::new(fd, buf).unwrap();
+                    return Ok(Some((reader, writer)));
+                }
+                Err(e) => match e {
+                    Errno::ENOENT => {
+                        // ENOENT means the operation was interrupted, it's safe to restart
+                        trace!("restart reading due to ENOENT");
+                        continue;
+                    }
+                    Errno::EINTR => {
+                        trace!("syscall interrupted");
+                        continue;
+                    }
+                    Errno::ENODEV => {
+                        debug!("got ENODEV when reading fuse fd, assuming fuse filesystem was umounted.");
+                        return Ok(None);
+                    }
+                    // No EAGAIN arm on purpose: unlike `FuseChannel`, this fd is
+                    // blocking (cloned via FUSE_DEV_IOC_CLONE, see the type docs),
+                    // and the kernel only returns EAGAIN from a fuse device read
+                    // for O_NONBLOCK file descriptions, so it cannot happen here.
+                    e => {
+                        warn! {"read fuse dev failed on fd {}: {}", fd, e};
+                        return Err(SessionFailure(format!("read new request: {e:?}")));
+                    }
+                },
             }
         }
     }
@@ -726,6 +821,57 @@ mod tests {
         se.umount().unwrap();
         se.set_fuse_file(cloned_file);
         se.mount().unwrap();
+    }
+
+    #[test]
+    fn test_new_blocking_channel() {
+        let dir = TempDir::new().unwrap();
+        let mut se = FuseSession::new(dir.as_path(), "foo", "bar", true).unwrap();
+        assert!(se.new_blocking_channel().is_err());
+
+        se.mount().unwrap();
+        let ch = se.new_blocking_channel().unwrap();
+        // The cloned fd has its own file description, so it stays blocking
+        // even though the session fd is O_NONBLOCK.
+        let flags = fcntl(ch.file.as_raw_fd(), FcntlArg::F_GETFL).unwrap();
+        assert_eq!(
+            OFlag::from_bits_truncate(flags) & OFlag::O_NONBLOCK,
+            OFlag::empty()
+        );
+
+        se.umount().unwrap();
+    }
+
+    #[test]
+    fn test_blocking_channel_exit_on_umount() {
+        let dir = TempDir::new().unwrap();
+        let mut se = FuseSession::new(dir.as_path(), "foo", "bar", true).unwrap();
+        se.mount().unwrap();
+
+        let mut ch = se.new_blocking_channel().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            // A freshly-mounted connection queues FUSE_INIT, so the first
+            // get_request() returns that request instead of blocking. Drain
+            // requests until the umount below tears the connection down and
+            // get_request() finally returns Ok(None): that is the teardown
+            // contract this test asserts, and the only way a blocking channel
+            // exits (FuseSession::wake() has no effect on it).
+            let torn_down = loop {
+                match ch.get_request() {
+                    Ok(None) => break true,
+                    Ok(Some(_)) => continue,
+                    Err(_) => break false,
+                }
+            };
+            tx.send(torn_down).unwrap();
+        });
+
+        se.umount().unwrap();
+        // The pending read must return (Ok(None)) once the connection is
+        // torn down; the timeout guards against a hang.
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
+        thread.join().unwrap();
     }
 }
 
