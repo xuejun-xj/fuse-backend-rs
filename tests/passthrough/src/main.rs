@@ -11,7 +11,9 @@ use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
-use fuse_backend_rs::transport::{FuseChannel, FuseSession};
+use fuse_backend_rs::transport::{
+    BlockingFuseChannel, FuseChannel, FuseDevWriter, FuseSession, Reader,
+};
 
 use simple_logger::SimpleLogger;
 
@@ -21,6 +23,8 @@ pub struct Daemon {
     mountpoint: String,
     server: Arc<Server<Arc<Vfs>>>,
     thread_cnt: u32,
+    // Use blocking fuse channels instead of the default epoll-based ones.
+    blocking: bool,
     session: Option<FuseSession>,
 }
 
@@ -38,7 +42,7 @@ impl From<fuse_backend_rs::transport::Error> for PassthroughFsError {
 #[allow(dead_code)]
 impl Daemon {
     /// Creates a fusedev daemon instance
-    pub fn new(src: &str, mountpoint: &str, thread_cnt: u32) -> Result<Self> {
+    pub fn new(src: &str, mountpoint: &str, thread_cnt: u32, blocking: bool) -> Result<Self> {
         // create vfs
         let vfs = Vfs::new(VfsOptions {
             no_open: false,
@@ -60,6 +64,7 @@ impl Daemon {
             mountpoint: mountpoint.to_string(),
             server: Arc::new(Server::new(Arc::new(vfs))),
             thread_cnt,
+            blocking,
             session: None,
         })
     }
@@ -83,18 +88,15 @@ impl Daemon {
         });
 
         for _ in 0..self.thread_cnt {
-            let mut server = FuseServer {
-                server: self.server.clone(),
-                ch: se.new_channel().unwrap(),
-            };
-            let _thread = thread::Builder::new()
-                .name("fuse_server".to_string())
-                .spawn(move || {
-                    info!("new fuse thread");
-                    let _ = server.svc_loop();
-                    warn!("fuse service thread exits");
-                })
-                .unwrap();
+            if self.blocking {
+                spawn_fuse_server(
+                    self.server.clone(),
+                    se.new_blocking_channel().unwrap(),
+                    true,
+                );
+            } else {
+                spawn_fuse_server(self.server.clone(), se.new_channel().unwrap(), false);
+            }
         }
         self.session = Some(se);
         Ok(())
@@ -116,15 +118,38 @@ impl Drop for Daemon {
     }
 }
 
-struct FuseServer {
-    server: Arc<Server<Arc<Vfs>>>,
-    ch: FuseChannel,
+/// `FuseChannel` and `BlockingFuseChannel` receive requests identically; this
+/// trait abstracts the shared `get_request()` so the service loop below is
+/// written once instead of once per channel type.
+trait GetRequest {
+    fn get_request(
+        &mut self,
+    ) -> fuse_backend_rs::transport::Result<Option<(Reader<'_>, FuseDevWriter<'_>)>>;
 }
 
-impl FuseServer {
+impl GetRequest for FuseChannel {
+    fn get_request(
+        &mut self,
+    ) -> fuse_backend_rs::transport::Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
+        FuseChannel::get_request(self)
+    }
+}
+
+impl GetRequest for BlockingFuseChannel {
+    fn get_request(
+        &mut self,
+    ) -> fuse_backend_rs::transport::Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
+        BlockingFuseChannel::get_request(self)
+    }
+}
+
+struct FuseServer<C> {
+    server: Arc<Server<Arc<Vfs>>>,
+    ch: C,
+}
+
+impl<C: GetRequest> FuseServer<C> {
     fn svc_loop(&mut self) -> Result<()> {
-        // Given error EBADF, it means kernel has shut down this session.
-        let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
         loop {
             if let Some((reader, writer)) = self
                 .ch
@@ -136,9 +161,8 @@ impl FuseServer {
                     .handle_message(reader, writer.into(), None, None)
                 {
                     match e {
-                        fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
-                            break;
-                        }
+                        // EncodeMessage means the kernel has shut down the session.
+                        fuse_backend_rs::Error::EncodeMessage(_) => break,
                         _ => {
                             error!("Handling fuse message failed");
                             continue;
@@ -154,20 +178,69 @@ impl FuseServer {
     }
 }
 
+/// Spawn one service thread that drives `ch` until the session is torn down.
+fn spawn_fuse_server<C>(server: Arc<Server<Arc<Vfs>>>, ch: C, blocking: bool)
+where
+    C: GetRequest + Send + 'static,
+{
+    let mut fuse_server = FuseServer { server, ch };
+    thread::Builder::new()
+        .name("fuse_server".to_string())
+        .spawn(move || {
+            if blocking {
+                info!("new fuse thread (blocking)");
+            } else {
+                info!("new fuse thread");
+            }
+            let _ = fuse_server.svc_loop();
+            warn!("fuse service thread exits");
+        })
+        .unwrap();
+}
+
 struct Args {
     src: String,
     dest: String,
+    threads: u32,
+    blocking: bool,
 }
 
 fn help() {
-    println!("Usage:\n   passthrough <src> <dest>\n");
+    println!(
+        "Usage:\n   passthrough <src> <dest> [threads] [blocking]\n   threads: service thread count (default 2)\n   blocking: true|false, use blocking fuse channels (default false)\n"
+    );
 }
 
 fn parse_args() -> Result<Args> {
     let args = env::args().collect::<Vec<String>>();
+    if args.len() < 3 {
+        help();
+        return Err(Error::from_raw_os_error(libc::EINVAL));
+    }
+    let threads: u32 = if args.len() >= 4 {
+        args[3].parse().map_err(|_| {
+            help();
+            Error::from_raw_os_error(libc::EINVAL)
+        })?
+    } else {
+        // Preserve the historical default: the daemon used to hardcode 2 threads,
+        // so callers that pass no thread count (e.g. xfstests_pathr.sh) keep their
+        // original parallelism.
+        2
+    };
+    let blocking = if args.len() >= 5 {
+        args[4].parse().map_err(|_| {
+            help();
+            Error::from_raw_os_error(libc::EINVAL)
+        })?
+    } else {
+        false
+    };
     let cmd_args = Args {
         src: args[1].clone(),
         dest: args[2].clone(),
+        threads,
+        blocking,
     };
     if cmd_args.src.len() == 0 || cmd_args.dest.len() == 0 {
         help();
@@ -210,7 +283,7 @@ fn main() -> Result<()> {
         src_dir, dest_dir
     );
 
-    let mut daemon = Daemon::new(src_dir, dest_dir, 2).unwrap();
+    let mut daemon = Daemon::new(src_dir, dest_dir, args.threads, args.blocking).unwrap();
     daemon.mount().unwrap();
 
     // main thread
