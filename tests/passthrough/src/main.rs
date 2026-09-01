@@ -71,12 +71,16 @@ impl Daemon {
             FuseSession::new(Path::new(&self.mountpoint), "testpassthrough", "", false).unwrap();
         se.mount().unwrap();
 
-        se.try_with_writer(|writer| {
+        // Ask the kernel to resend pending requests, if any. This is
+        // best-effort: FUSE_NOTIFY_RESEND was added in kernel 6.9 and older
+        // kernels reject it with EINVAL, which used to abort the daemon at
+        // startup. There is nothing to resend right after the connection is
+        // established, so a failure here is harmless.
+        let _ = se.try_with_writer(|writer| {
             self.server
                 .notify_resend(writer)
                 .map_err(PassthroughFsError::FuseError)
-        })
-        .map_err(|_| Error::from_raw_os_error(libc::EINVAL))?;
+        });
 
         for _ in 0..self.thread_cnt {
             let mut server = FuseServer {
