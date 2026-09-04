@@ -202,9 +202,9 @@ impl FuseSession {
 
     /// Mount the fuse mountpoint, building connection with the in kernel fuse driver.
     pub fn mount(&mut self) -> Result<()> {
-        let mut flags = self.mount_flags.unwrap_or(
-            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME
-        );
+        let mut flags = self
+            .mount_flags
+            .unwrap_or(MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOATIME);
         if self.readonly {
             flags |= MsFlags::MS_RDONLY;
         }

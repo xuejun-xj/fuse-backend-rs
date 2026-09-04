@@ -95,7 +95,10 @@ mod fusedev_tests {
         // Check if all expected flags are present in the output
         for flag in expected_flags_str {
             if !output.contains(&flag) {
-                error!("Expected flag '{}' not found in mount options: {}", flag, output);
+                error!(
+                    "Expected flag '{}' not found in mount options: {}",
+                    flag, output
+                );
                 return false;
             }
         }
@@ -158,10 +161,7 @@ mod fusedev_tests {
         let src_dir = src.to_str().unwrap();
         let tmp_dir = TempDir::new().unwrap();
         let mnt_dir = tmp_dir.as_path().to_str().unwrap();
-        info!(
-            "test mount flags src {:?} mountpoint {}",
-            src_dir, mnt_dir
-        );
+        info!("test mount flags src {:?} mountpoint {}", src_dir, mnt_dir);
 
         // Create a set of custom mount flags
         let custom_flags = MsFlags::MS_NODEV | MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC;
