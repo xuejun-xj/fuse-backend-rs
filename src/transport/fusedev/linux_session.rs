@@ -16,7 +16,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::transport::fusedev::FuseSessionExt;
+use crate::transport::fusedev::{FuseChannelExt, FuseSessionExt};
 use mio::{Events, Poll, Token, Waker};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag, OFlag};
@@ -520,6 +520,18 @@ impl BlockingFuseChannel {
                 },
             }
         }
+    }
+}
+
+impl FuseChannelExt for FuseChannel {
+    fn next_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
+        FuseChannel::get_request(self)
+    }
+}
+
+impl FuseChannelExt for BlockingFuseChannel {
+    fn next_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
+        BlockingFuseChannel::get_request(self)
     }
 }
 

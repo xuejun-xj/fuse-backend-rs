@@ -407,6 +407,35 @@ pub trait FuseSessionExt {
     }
 }
 
+/// Abstraction over the fusedev channels that receive requests from `/dev/fuse`.
+///
+/// Every fusedev channel exposes an inherent `get_request()` entry point: the
+/// epoll-based [`FuseChannel`] on Linux, the blocking-read [`FuseChannel`] on
+/// macOS and fuse-t, and Linux's `BlockingFuseChannel`. This trait names that
+/// shared operation `next_request()`, forwarding to each channel's inherent
+/// method, so a service loop can be written once, generic over the concrete
+/// channel type, instead of once per channel.
+///
+/// The trait method is deliberately named differently from the inherent
+/// `get_request()`: the distinct name keeps each forwarding call unambiguous
+/// and means that removing an inherent method surfaces as a compile error
+/// instead of silently turning the forward into infinite recursion.
+///
+/// This covers only the `/dev/fuse`-based channels: the virtiofs and
+/// FUSE-over-io_uring transports receive requests through different mechanisms
+/// and intentionally do not implement this trait.
+pub trait FuseChannelExt {
+    /// Get the next available FUSE request from the underlying fuse device.
+    ///
+    /// Returns:
+    /// - Ok(None): the channel should stop, either because the session was
+    ///   umounted/aborted or because a wakeup was delivered
+    /// - Ok(Some((reader, writer))): reader to receive the request and writer
+    ///   to send the reply
+    /// - Err(e): error message
+    fn next_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>>;
+}
+
 #[cfg(feature = "async-io")]
 mod async_io {
     use super::*;

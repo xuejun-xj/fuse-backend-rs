@@ -29,6 +29,7 @@ use super::{
     Error::IoError, Error::SessionFailure, FuseBuf, FuseDevWriter, Reader, Result,
     FUSE_HEADER_SIZE, FUSE_KERN_BUF_PAGES,
 };
+use crate::transport::fusedev::FuseChannelExt;
 use crate::transport::pagesize;
 
 // These follows definition from libfuse.
@@ -354,6 +355,12 @@ impl FuseChannel {
         let reader = Reader::from_fuse_buffer(FuseBuf::new(&mut self.buf[..header_len])).unwrap();
         let writer = FuseDevWriter::new(fd, buf).unwrap();
         Ok(Some((reader, writer)))
+    }
+}
+
+impl FuseChannelExt for FuseChannel {
+    fn next_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
+        FuseChannel::get_request(self)
     }
 }
 

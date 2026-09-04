@@ -1,4 +1,3 @@
-use fuse_backend_rs::transport::FuseSessionExt as _;
 use log::{error, info, warn, LevelFilter};
 use std::env;
 use std::fs;
@@ -11,9 +10,7 @@ use signal_hook::{consts::TERM_SIGNALS, iterator::Signals};
 
 use fuse_backend_rs::api::{server::Server, Vfs, VfsOptions};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
-use fuse_backend_rs::transport::{
-    BlockingFuseChannel, FuseChannel, FuseDevWriter, FuseSession, Reader,
-};
+use fuse_backend_rs::transport::{FuseChannelExt, FuseSession, FuseSessionExt as _};
 
 use simple_logger::SimpleLogger;
 
@@ -118,42 +115,17 @@ impl Drop for Daemon {
     }
 }
 
-/// `FuseChannel` and `BlockingFuseChannel` receive requests identically; this
-/// trait abstracts the shared `get_request()` so the service loop below is
-/// written once instead of once per channel type.
-trait GetRequest {
-    fn get_request(
-        &mut self,
-    ) -> fuse_backend_rs::transport::Result<Option<(Reader<'_>, FuseDevWriter<'_>)>>;
-}
-
-impl GetRequest for FuseChannel {
-    fn get_request(
-        &mut self,
-    ) -> fuse_backend_rs::transport::Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
-        FuseChannel::get_request(self)
-    }
-}
-
-impl GetRequest for BlockingFuseChannel {
-    fn get_request(
-        &mut self,
-    ) -> fuse_backend_rs::transport::Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
-        BlockingFuseChannel::get_request(self)
-    }
-}
-
 struct FuseServer<C> {
     server: Arc<Server<Arc<Vfs>>>,
     ch: C,
 }
 
-impl<C: GetRequest> FuseServer<C> {
+impl<C: FuseChannelExt> FuseServer<C> {
     fn svc_loop(&mut self) -> Result<()> {
         loop {
             if let Some((reader, writer)) = self
                 .ch
-                .get_request()
+                .next_request()
                 .map_err(|_| std::io::Error::from_raw_os_error(libc::EINVAL))?
             {
                 if let Err(e) = self
@@ -181,7 +153,7 @@ impl<C: GetRequest> FuseServer<C> {
 /// Spawn one service thread that drives `ch` until the session is torn down.
 fn spawn_fuse_server<C>(server: Arc<Server<Arc<Vfs>>>, ch: C, blocking: bool)
 where
-    C: GetRequest + Send + 'static,
+    C: FuseChannelExt + Send + 'static,
 {
     let mut fuse_server = FuseServer { server, ch };
     thread::Builder::new()

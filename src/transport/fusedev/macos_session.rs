@@ -35,7 +35,7 @@ use super::{
     Error::IoError, Error::SessionFailure, FuseBuf, FuseDevWriter, Reader, Result,
     FUSE_HEADER_SIZE, FUSE_KERN_BUF_PAGES,
 };
-use crate::transport::fusedev::FuseSessionExt;
+use crate::transport::fusedev::{FuseChannelExt, FuseSessionExt};
 use crate::transport::pagesize;
 
 const OSXFUSE_MOUNT_PROG: &str = "/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse";
@@ -279,6 +279,12 @@ impl FuseChannel {
                 },
             }
         }
+    }
+}
+
+impl FuseChannelExt for FuseChannel {
+    fn next_request(&mut self) -> Result<Option<(Reader<'_>, FuseDevWriter<'_>)>> {
+        FuseChannel::get_request(self)
     }
 }
 
